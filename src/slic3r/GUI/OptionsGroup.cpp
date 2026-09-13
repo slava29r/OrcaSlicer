@@ -181,8 +181,8 @@ void OptionsGroup::remove_option_if(std::function<bool(std::string const&)> cons
         opts.erase(std::remove_if(opts.begin(), opts.end(), [&comp](Option& o) { return comp(o.opt.opt_key); }), opts.end());
         l.undo_to_sys = true;
     }
-    for (int i = m_lines.size() - 1; i >= 0; --i) {
-        if (m_lines[i].get_options().empty())
+    for (int i = (int)m_lines.size() - 1; i >= 0; --i) {
+        if (m_lines[i].get_options().empty() && i < (int)m_options_mode.size())
             m_options_mode.erase(m_options_mode.begin() + i);
     }
     m_lines.erase(std::remove_if(m_lines.begin(), m_lines.end(), [](auto& l) { return l.get_options().empty(); }), m_lines.end());
@@ -268,7 +268,14 @@ Line* OptionsGroup::get_line(const std::string& opt_key)
     return nullptr;
 }
 
-void OptionsGroup::append_separator() { m_lines.emplace_back(Line()); }
+void OptionsGroup::append_separator()
+{
+    m_lines.emplace_back(Line());
+    // Keep m_options_mode aligned with m_lines. TabPrintModel::build() later
+    // walks both arrays together in remove_option_if(); a separator-only line
+    // would otherwise make that erase run past m_options_mode.
+    m_options_mode.push_back(comSimple);
+}
 
 void OptionsGroup::activate_line(Line& line)
 {
