@@ -75,6 +75,20 @@ public:
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result);
 
+    // Independent towers only plan the layers a filament actually prints, so each tower is
+    // compacted even when the global no-sparse option is off (otherwise later towers print in air).
+    void set_sparse_layers_skipped(bool v) { m_sparse_layers_skipped = v; }
+
+    // One solid tower per filament. Synthetic toolchanges must not trip interface-temp/purge
+    // or cut a gap-wall retract hole, and the layer is brim → walls → infill.
+    void set_independent_tower(bool v) {
+        m_independent_tower = v;
+        if (v) {
+            m_enable_tower_interface_features = false;
+            m_use_gap_wall                    = false;
+        }
+    }
+
     float get_depth() const { return m_wipe_tower_depth; }
 	std::vector<std::pair<float, float>> get_z_and_depth_pairs() const;
     float get_brim_width() const { return m_wipe_tower_brim_width_real; }
@@ -112,6 +126,8 @@ public:
 		m_layer_height			= layer_height;
 		m_depth_traversed  = 0.f;
         m_current_layer_finished = false;
+        m_shell_done_this_layer  = false;
+        m_brim_done_this_layer   = false;
         m_prev_layer_had_interface = m_current_layer_has_interface;
 
 		
@@ -150,8 +166,9 @@ public:
 		bool 						last_wipe_inside_wipe_tower);
 
 	// Returns gcode for a toolchange and a final print head position.
-	// On the first layer, extrude a brim around the future wipe tower first.
-    WipeTower::ToolChangeResult tool_change(size_t new_tool);
+	// print_shell: on the first layer, anchor the footprint with the brim before the purge.
+	// The walls themselves are printed by finish_layer(), after the purge and the infill.
+    WipeTower::ToolChangeResult tool_change(size_t new_tool, bool print_shell = false);
 
 	// Fill the unfilled space with a sparse infill.
 	// Call this method only if layer_finished() is false.
@@ -200,6 +217,8 @@ public:
         float               tower_interface_pre_extrusion_length = 0.f;
         float               tower_ironing_area = 4.f;
         float               tower_interface_purge_length = 0.f;
+        // Tallest layer this filament's nozzle can lay down; caps the sparse layer combination.
+        float               max_layer_height = 0.f;
     };
 
 private:
@@ -241,6 +260,8 @@ private:
 	float  m_wipe_tower_cone_angle = 0.f;
     float  m_wipe_tower_brim_width      = 0.f; 	// Width of brim (mm) from config
     float  m_wipe_tower_brim_width_real = 0.f; 	// Width of brim (mm) after generation
+    float  m_wipe_tower_brim_object_gap = 0.f;
+    float  m_wipe_tower_brim_flow_ratio = 1.f;
     BoundingBoxf m_first_layer_bbx;              // Actual first-layer bounding box (incl. brim/ribs)
 	float  m_wipe_tower_rotation_angle = 0.f; // Wipe tower rotation angle in degrees (with respect to x axis)
     float  m_internal_rotation  = 0.f;
@@ -260,6 +281,14 @@ private:
     bool   m_wait_for_temp_on_wipe_tower = false;
     bool   m_prev_layer_had_interface = false;
     bool   m_current_layer_has_interface = false;
+    bool   m_independent_tower        = false;
+    bool   m_shell_done_this_layer    = false;
+    bool   m_brim_done_this_layer     = false;
+    // Outer-wall centreline of the last layer that actually extruded one, in the same
+    // frame the writer emits (local polygon shifted by that layer's m_y_shift). Empty
+    // until the first wall. The next wall is not allowed to leave this outline by more
+    // than half a bead, so a rib/cone step or a skipped layer cannot print in the air.
+    Polygon m_last_outer_wall;
 
 	int m_wall_type;
     bool   m_used_fillet                  = true;
@@ -281,7 +310,10 @@ private:
     float           m_parking_pos_retraction    = 0.f;
     float           m_extra_loading_move        = 0.f;
     float           m_bridging                  = 0.f;
-    bool            m_no_sparse_layers          = false;
+    bool            m_sparse_layers_skipped     = false;
+    bool            m_use_first_layer_height    = false;
+    float           m_initial_layer_print_height = 0.f;
+    bool            m_sparse_layers_combined    = false;
     bool            m_set_extruder_trimpot      = false;
     bool            m_adhesion                  = true;
     GCodeFlavor     m_gcode_flavor;
@@ -363,6 +395,12 @@ private:
 	// Calculates depth for all layers and propagates them downwards
 	void plan_tower();
 
+    // With no_sparse_layers, G-code drops every plan layer that has no tool change,
+    // including the object's first layer. The first layer that actually prints then
+    // carries that later object-layer height. When the option is on, reprint that
+    // layer at initial_layer_print_height so the tower still sits on a first-layer bead.
+    void apply_no_sparse_first_layer_height();
+
     // Goes through m_plan, calculates border and finish_layer extrusions and subtracts them from last wipe
     void save_on_last_wipe();
 
@@ -382,6 +420,8 @@ private:
 		float z;		// z position of the layer
 		float height;	// layer height
 		float depth;	// depth of the layer based on all layers above
+		// Folded into a later, thicker layer, so this one prints nothing at all.
+		bool  combined_away{false};
 		float toolchanges_depth() const { float sum = 0.f; for (const auto &a : tool_changes) sum += a.required_depth; return sum; }
 
 		std::vector<ToolChange> tool_changes;
@@ -441,14 +481,25 @@ private:
                                       bool                   rib_wall,
                                       bool                   extrude_perimeter);
 
-    Polygon generate_support_cone_wall(
-        WipeTowerWriter2& writer, 
-		const WipeTower::box_coordinates& wt_box, 
-		double feedrate, 
-		bool infill_cone, 
-		float spacing);
-
     Polygon generate_rib_polygon(const WipeTower::box_coordinates& wt_box);
+
+    // Designed centreline of this layer's outer wall (rib, rectangle or cone), before the
+    // support clamp. Not extruded.
+    Polygon desired_wall_polygon(WipeTowerWriter2& writer);
+    Polygon make_cone_wall_polygon(const WipeTower::box_coordinates& wt_box) const;
+    // Pull `desired` back onto m_last_outer_wall. The centreline may move by at most half a
+    // bead (a small overhang that still overlaps the previous bead). Returns local coordinates.
+    Polygon clamp_wall_to_support(Polygon desired) const;
+    void extrude_one_wall(WipeTowerWriter2& writer, const Polygon& poly, float feedrate, bool gap);
+    // Solid fill of the cone's ears. First layer only; the upper cone is a wall on that fill.
+    void extrude_cone_ear_infill(WipeTowerWriter2& writer, const Polygon& poly,
+                                 const WipeTower::box_coordinates& wt_box, float feedrate, float spacing);
+    // First printed layer only. No-op once this layer has already anchored the brim.
+    void extrude_first_layer_brim(WipeTowerWriter2& writer);
+
+    // Two wall loops after the infill: inner first (welds to the purge), then the outer loop
+    // held on the previous layer's wall. Returns the outer centreline for the wipe path.
+    Polygon extrude_tower_shell(WipeTowerWriter2& writer, bool first_layer);
 
     // Lay the brim loops around the tower outline (first layer only) and record the brim width
     // and first-layer bounding box the Print object needs for the skirt and the preview box.

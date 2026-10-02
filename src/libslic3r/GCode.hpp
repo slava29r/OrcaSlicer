@@ -39,6 +39,7 @@ namespace Slic3r {
 
 // Forward declarations.
 class GCode;
+struct WipeInwardSupport;
 
 namespace CustomGCode{ struct Item; }
 struct PrintInstance;
@@ -61,7 +62,7 @@ public:
     bool enable;
     Polyline path;
 
-    // Orca:
+    // Orca: retraction portions emitted before, during, and after the wipe move.
     struct RetractionValues{
         double retraction_length_before_wipe = 0.;
         double retraction_length_during_wipe = 0.;
@@ -73,8 +74,10 @@ public:
     void reset_path() { this->path = Polyline(); }
     std::string wipe(GCode &gcodegen, double length, bool toolchange = false, bool is_last = false);
 
-    // Orca:
+    // Orca: calculate the retraction portions that can be emitted at wipe speed.
     RetractionValues calculateWipeRetractionLengths(GCode& gcodegen, bool toolchange);
+    // Orca: rebuild the stored path while deduplicating shared path boundaries.
+    void update_path(const ExtrusionPaths &paths, bool reverse = false);
 };
 
 class WipeTowerIntegration {
@@ -103,8 +106,18 @@ public:
         m_enable_wrapping_detection(print_config.enable_wrapping_detection && (print_config.wrapping_exclude_area.values.size() > 2) && (slice_used_filaments.size() <= 1)),
         m_is_first_print(true),
         m_print_config(&print_config),
-        m_last_wipe_tower_print_z(print_config.z_offset.value)
+        m_plate_idx(plate_idx),
+        m_last_wipe_tower_print_z(print_config.z_offset.value),
+        m_sparse_layers_skipped(wipe_tower_sparse_layers_skipped(print_config)),
+        m_independent_towers(print_config.prime_tower_independent && !print_config.prime_tower_multimaterial),
+        m_independent_last_z(print_config.filament_colour.values.size(), print_config.z_offset.value),
+        m_independent_z_layer(print_config.filament_colour.values.size(), -1),
+        m_sparse_layers_combined(wipe_tower_sparse_layers_combined(print_config))
     {
+        // Precomputed rather than accumulated while emitting, so that the clearance validator and
+        // the emitter cannot disagree about where the compacted tower sits on any given layer.
+        if (m_sparse_layers_skipped)
+            m_compacted_tower_z = compute_compacted_wipe_tower_z(tool_changes, float(print_config.z_offset.value));
         // initialize with the extruder offset of master extruder id
         m_extruder_offsets.resize(print_config.filament_map.size(), print_config.extruder_offset.get_at(print_config.master_extruder_id.value - 1));
         const auto& filament_map = print_config.filament_map.values; // 1 based idx
@@ -130,10 +143,25 @@ public:
 private:
     WipeTowerIntegration& operator=(const WipeTowerIntegration&);
     std::string append_tcr(GCode &gcodegen, const WipeTower::ToolChangeResult &tcr, int new_extruder_id, double z = -1.) const;
+    std::string tower_height_tag(GCode &gcodegen, const WipeTower::ToolChangeResult &tcr, const std::string &tcr_gcode) const;
     Polyline generate_path_to_wipe_tower(const Point &start_pos, const Point &end_pos, const BoundingBox &avoid_polygon, const Polygons &bed_polygons) const;
     std::string append_tcr2(GCode &gcodegen, const WipeTower::ToolChangeResult &tcr, int new_extruder_id, double z = -1.) const;
-    std::string travel_to_tower_gap(GCode &gcodegen, const Point &route_start, const Point &start_wipe_pos) const;
-    Vec2f transform_wt2_pt(const Vec2f &pt) const;
+    std::string travel_to_tower_gap(GCode &gcodegen, const Point &route_start, const Point &start_wipe_pos, const Vec2f &tower_pos) const;
+    Vec2f transform_wt2_pt(const Vec2f &pt) const { return transform_wt2_pt(pt, m_wipe_tower_pos); }
+    Vec2f transform_wt2_pt(const Vec2f &pt, const Vec2f &tower_pos) const;
+    Vec2f tcr_tower_pos(const WipeTower::ToolChangeResult &tcr) const
+    {
+        if (tcr.has_tower_pos) {
+            Vec2f stored;
+            if (tcr.tower_filament >= 0 &&
+                independent_wipe_tower_stored_pos(m_print_config->independent_wipe_tower_x.values,
+                                                  m_print_config->independent_wipe_tower_y.values,
+                                                  independent_wipe_tower_pos_index(m_plate_idx, tcr.tower_filament), stored))
+                return stored;
+            return tcr.tower_pos;
+        }
+        return m_wipe_tower_pos;
+    }
     Polygons shared_printable_area(GCode &gcodegen) const;
 
     // Postprocesses gcode: rotates and moves G1 extrusions and returns result
@@ -161,9 +189,24 @@ private:
     bool                                                         m_enable_wrapping_detection;
     bool                                                         m_is_first_print;
     const PrintConfig *                                          m_print_config;
+    const int                                                    m_plate_idx;
     float                                                        m_wipe_tower_depth;
     BoundingBoxf                                                 m_wipe_tower_bbx;
     Vec2f                                                        m_rib_offset{Vec2f(0, 0)};
+    // wipe_tower_no_sparse_layers, as answered by the shared compaction rule rather than by the raw
+    // option: smooth timelapse and wrapping detection keep a tower on every layer regardless.
+    const bool                                                   m_sparse_layers_skipped;
+    // Combined tower layers are thicker than the object layer they sit on, the only case where the
+    // tower's height is not the one process_layer already declared.
+    const bool                                                   m_sparse_layers_combined;
+    // Print z of the compacted tower per planned layer. Empty when the tower is not compacted.
+    std::vector<float>                                           m_compacted_tower_z;
+    const bool                                                   m_independent_towers;
+    // Compacted print z per independent tower (indexed by group id = tower_filament), and the
+    // print layer it was last raised on, so a tower rises once per layer however many filaments
+    // of its group purge into it.
+    std::vector<double>                                          m_independent_last_z;
+    std::vector<int>                                             m_independent_z_layer;
 };
 
 class ColorPrintColors
@@ -258,11 +301,16 @@ public:
     void            apply_print_config(const PrintConfig &print_config);
 
     std::string     travel_to(const Point& point, ExtrusionRole role, std::string comment, double z = DBL_MAX);
+    // While a Type2 prime-tower block is being written, travel_to / extrude use this instead of the
+    // normal travel/print accelerations. 0 = no override.
+    void            set_prime_tower_acceleration_override(unsigned int accel) { m_wipe_tower_acceleration = accel; }
     bool            needs_retraction(const Polyline& travel, ExtrusionRole role, LiftType& lift_type);
     std::string     retract(bool toolchange = false, bool is_last_retraction = false, LiftType lift_type = LiftType::NormalLift, bool apply_instantly = false, ExtrusionRole role = erNone);
     // extra_retract forwards a PETG pre-extrusion over-extrusion; default 0 -> identical to the plain deretract.
     std::string     unretract(float extra_retract = 0.f) { return m_writer.unlift() + m_writer.unretract(extra_retract); }
     std::string     set_extruder(unsigned int extruder_id, double print_z, bool by_object=false, int toolchange_temp_override = -1, bool defer_temp_wait = false);
+    // Sets the pressure advance of the filament's extruder variant, if enabled for it.
+    std::string     set_filament_pressure_advance(unsigned int filament_id);
     bool is_BBL_Printer();
     WipeTowerType wipe_tower_type();
 
@@ -276,6 +324,9 @@ public:
     // resolver keys filament-indexed arrays, the nozzle resolver keys (extruder x volume-type)
     // slot arrays. Both degenerate to filament_id / extruder index on single-volume printers.
     size_t get_filament_config_index(int filament_id) const;
+    // The filament resolver for a given layer, for the export pipeline stages after the generator,
+    // which run behind the current layer and concurrently with the generator.
+    size_t get_filament_config_index(int filament_id, size_t layer_id) const;
     size_t get_nozzle_config_index(int filament_id) const;
 
     // Object and support extrusions of the same PrintObject at the same print_z.
@@ -427,17 +478,19 @@ private:
                                                            double &y_acceleration_limit_res, double &accumulated_mass_res);
     // Orca: pass the complete collection of region perimeters to the extrude loop to check whether the wipe before external loop
     // should be executed
-    std::string extrude_entity(const ExtrusionEntity&      entity,
-                               const std::string&          description       = "",
-                               double                      speed             = -1.,
-                               const ExtrusionEntitiesPtr& region_perimeters = ExtrusionEntitiesPtr());
+    std::string extrude_entity(const ExtrusionEntity&                     entity,
+                               const std::string&                         description       = "",
+                               double                                     speed             = -1.,
+                               const std::vector<const ExtrusionEntity*>& region_perimeters = {},
+                               const WipeInwardSupport*                   wipe_support      = nullptr);
     // Orca: pass the complete collection of region perimeters to the extrude loop to check whether the wipe before external loop
     // should be executed
-    std::string extrude_loop(const ExtrusionLoop&        loop,
-                             const std::string&          description,
-                             double                      speed             = -1.,
-                             const ExtrusionEntitiesPtr& region_perimeters = ExtrusionEntitiesPtr(),
-                             const Point*                start_point       = nullptr);
+    std::string extrude_loop(const ExtrusionLoop&                       loop,
+                             const std::string&                         description,
+                             double                                     speed             = -1.,
+                             const std::vector<const ExtrusionEntity*>& region_perimeters = {},
+                             const Point*                               start_point       = nullptr,
+                             const WipeInwardSupport*                   wipe_support      = nullptr);
     std::string extrude_multi_path(const ExtrusionMultiPath& multipath, const std::string& description = "", double speed = -1.);
     std::string extrude_path(const ExtrusionPath& path, const std::string& description = "", double speed = -1.);
 
@@ -461,17 +514,19 @@ private:
     {
         ObjectByExtruder() : support(nullptr), support_extrusion_role(erNone) {}
         const ExtrusionEntityCollection  *support;
-        // erSupportMaterial / erSupportMaterialInterface / erSupportTransition or erMixed.
+        // erSupportMaterial / erSupportMaterialInterface / erSupportTransition, erIroning or erMixed.
         ExtrusionRole                     support_extrusion_role;
+        // Set when support ironing shares this group's extruder, so the group emits the ironing pass too.
+        // A dedicated erIroning group prints it via its role instead.
+        bool                              prints_ironing = false;
 
         struct Island
         {
             struct Region {
             	// Non-owned references to LayerRegion::perimeters::entities
-            	// std::vector<const ExtrusionEntity*> would be better here, but there is no way in C++ to convert from std::vector<T*> std::vector<const T*> without copying.
-                ExtrusionEntitiesPtr perimeters;
+                std::vector<const ExtrusionEntity*> perimeters;
             	// Non-owned references to LayerRegion::fills::entities
-                ExtrusionEntitiesPtr infills;
+                std::vector<const ExtrusionEntity*> infills;
 
                 std::vector<const WipingExtrusions::ExtruderPerCopy*> infills_overrides;
                 std::vector<const WipingExtrusions::ExtruderPerCopy*> perimeters_overrides;
@@ -519,7 +574,7 @@ private:
 		// For sequential print, the instance of the object to be printing has to be defined.
 		const size_t                     				 single_object_instance_idx);
 
-    std::string     extrude_perimeters(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool is_first_layer, bool is_infill_first);
+    std::string     extrude_perimeters(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool is_first_layer, bool is_infill_first, bool unsupported_loops_only = false);
     std::string     extrude_infill(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool ironing);
     std::string     extrude_support(const ExtrusionEntityCollection& support_fills, const ExtrusionRole support_extrusion_role);
 
@@ -695,6 +750,7 @@ private:
 
     // Always check gcode placeholders when building in debug mode.
 #if !defined(NDEBUG)
+#undef ORCA_CHECK_GCODE_PLACEHOLDERS
 #define ORCA_CHECK_GCODE_PLACEHOLDERS 1
 #endif
     
@@ -753,6 +809,7 @@ private:
     double   m_sub_layer_flow_ratio = 0.0;
     double   m_sub_layer_height     = 0.0;
     bool m_need_change_layer_lift_z = false;
+    unsigned int m_wipe_tower_acceleration = 0;
     int m_start_gcode_filament = -1;
     std::string m_filament_instances_code;
 

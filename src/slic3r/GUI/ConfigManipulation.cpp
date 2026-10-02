@@ -78,12 +78,12 @@ void ConfigManipulation::set_option_label(const std::string& opt_key, const wxSt
         cb_set_option_label(opt_key, label, opt_index);
 }
 
-void ConfigManipulation::check_nozzle_recommended_temperature_range(DynamicPrintConfig *config) {
+void ConfigManipulation::check_nozzle_recommended_temperature_range(DynamicPrintConfig *config, unsigned int variant_index) {
     if (is_msg_dlg_already_exist)
         return;
 
     int temperature_range_low, temperature_range_high;
-    if (!get_temperature_range(config, temperature_range_low, temperature_range_high)) return;
+    if (!get_temperature_range(config, temperature_range_low, temperature_range_high, variant_index)) return;
 
     // Get the selected filament type
     std::string filament_type = "";
@@ -123,16 +123,16 @@ void ConfigManipulation::check_nozzle_recommended_temperature_range(DynamicPrint
     }
 }
 
-void ConfigManipulation::check_nozzle_temperature_range(DynamicPrintConfig *config)
+void ConfigManipulation::check_nozzle_temperature_range(DynamicPrintConfig *config, unsigned int variant_index)
 {
     if (is_msg_dlg_already_exist)
         return;
 
     int temperature_range_low, temperature_range_high;
-    if (!get_temperature_range(config, temperature_range_low, temperature_range_high)) return;
+    if (!get_temperature_range(config, temperature_range_low, temperature_range_high, variant_index)) return;
 
     if (config->has("nozzle_temperature")) {
-        if (config->opt_int("nozzle_temperature", 0) < temperature_range_low || config->opt_int("nozzle_temperature", 0) > temperature_range_high) {
+        if (config->opt_int("nozzle_temperature", variant_index) < temperature_range_low || config->opt_int("nozzle_temperature", variant_index) > temperature_range_high) {
             wxString msg_text = _(L("The nozzle may become clogged when the temperature is out of the recommended range.\nPlease make sure whether to use this temperature to print.\n\n"));
             msg_text += wxString::Format(_L("The recommended nozzle temperature for this filament type is [%d, %d] degrees Celsius."), temperature_range_low, temperature_range_high);
             MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
@@ -143,17 +143,17 @@ void ConfigManipulation::check_nozzle_temperature_range(DynamicPrintConfig *conf
     }
 }
 
-void ConfigManipulation::check_nozzle_temperature_initial_layer_range(DynamicPrintConfig* config)
+void ConfigManipulation::check_nozzle_temperature_initial_layer_range(DynamicPrintConfig* config, unsigned int variant_index)
 {
     if (is_msg_dlg_already_exist)
         return;
 
     int temperature_range_low, temperature_range_high;
-    if (!get_temperature_range(config, temperature_range_low, temperature_range_high)) return;
+    if (!get_temperature_range(config, temperature_range_low, temperature_range_high, variant_index)) return;
 
     if (config->has("nozzle_temperature_initial_layer")) {
-        if (config->opt_int("nozzle_temperature_initial_layer", 0) < temperature_range_low ||
-            config->opt_int("nozzle_temperature_initial_layer", 0) > temperature_range_high)
+        if (config->opt_int("nozzle_temperature_initial_layer", variant_index) < temperature_range_low ||
+            config->opt_int("nozzle_temperature_initial_layer", variant_index) > temperature_range_high)
         {
             wxString msg_text = _(L("The nozzle may become clogged when the temperature is out of the recommended range.\nPlease make sure whether to use this temperature to print.\n\n"));
             msg_text += wxString::Format(_L("The recommended nozzle temperature for this filament type is [%d, %d] degrees Celsius."), temperature_range_low, temperature_range_high);
@@ -171,14 +171,16 @@ void ConfigManipulation::check_adaptive_pressure_advance_model(DynamicPrintConfi
         return;
 
     const auto* model = config->option<ConfigOptionStrings>("adaptive_pressure_advance_model");
-    if (model == nullptr || model->values.empty())
+    if (model == nullptr)
         return;
 
-    std::string raw_model;
-    for (const std::string& chunk : model->values)
-        raw_model += chunk;
-
-    std::string error = AdaptivePAProcessor::validate_adaptive_pa_model(raw_model);
+    // Each extruder variant holds its own model.
+    std::string error;
+    for (const std::string& variant_model : model->values) {
+        error = AdaptivePAProcessor::validate_adaptive_pa_model(variant_model);
+        if (!error.empty())
+            break;
+    }
     if (!error.empty()) {
         wxString msg_text = _L("Adaptive Pressure Advance model validation failed:\n");
         msg_text += from_u8(error);
@@ -208,6 +210,30 @@ void ConfigManipulation::check_filament_max_volumetric_speed(DynamicPrintConfig 
         is_msg_dlg_already_exist = false;
     }
 
+}
+
+void ConfigManipulation::check_filament_ironing_spacing(DynamicPrintConfig *config)
+{
+    const auto *opt = config->option<ConfigOptionFloatsNullable>("filament_ironing_spacing");
+    if (opt == nullptr)
+        return;
+    std::vector<double> values = opt->values;
+    bool                reset  = false;
+    for (size_t i = 0; i < values.size(); ++i)
+        if (!opt->is_nil(i) && values[i] < IRONING_SPACING_MIN) {
+            values[i] = 0.1;
+            reset     = true;
+        }
+    if (!reset)
+        return;
+    const wxString     msg_text = _(L("Ironing spacing too small\nIt has been reset to 0.1"));
+    MessageDialog      dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
+    DynamicPrintConfig new_conf = *config;
+    is_msg_dlg_already_exist    = true;
+    dialog.ShowModal();
+    new_conf.set_key_value("filament_ironing_spacing", new ConfigOptionFloatsNullable(values));
+    apply(config, &new_conf);
+    is_msg_dlg_already_exist = false;
 }
 
 void ConfigManipulation::check_chamber_temperature(DynamicPrintConfig* config)
@@ -332,7 +358,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     }
 
     //BBS: ironing_spacing shouldn't be too small or equal to zero
-    if (config->opt_float("ironing_spacing") < 0.05)
+    if (config->opt_float("ironing_spacing") < IRONING_SPACING_MIN)
     {
         const wxString msg_text = _(L("Ironing spacing too small\nIt has been reset to 0.1"));
         MessageDialog dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
@@ -343,7 +369,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
     }
-    if (config->opt_float("support_ironing_spacing") < 0.05)
+    if (config->opt_float("support_ironing_spacing") < IRONING_SPACING_MIN)
     {
         const wxString msg_text = _(L("Ironing spacing too small\nIt has been reset to 0.1"));
         MessageDialog dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
@@ -553,6 +579,15 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         config->opt_enum<WipeTowerWallType>("wipe_tower_wall_type") != WipeTowerWallType::wtwRectangle) {
         DynamicPrintConfig new_conf = *config;
         new_conf.set_key_value("wipe_tower_wall_type", new ConfigOptionEnum<WipeTowerWallType>(WipeTowerWallType::wtwRectangle));
+        apply(config, &new_conf);
+    }
+
+    // Independent towers and the multimaterial shell/core tower cannot run together: one
+    // splits the footprint, the other prints a whole tower per filament.
+    if (config->opt_bool("enable_prime_tower") && config->opt_bool("prime_tower_independent") &&
+        config->opt_bool("prime_tower_multimaterial")) {
+        DynamicPrintConfig new_conf = *config;
+        new_conf.set_key_value("prime_tower_multimaterial", new ConfigOptionBool(false));
         apply(config, &new_conf);
     }
 
@@ -979,7 +1014,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     bool can_ironing_support = have_raft || (have_support_material && config->opt_int("support_interface_top_layers") > 0);
     toggle_field("support_ironing", can_ironing_support);
     bool has_support_ironing = can_ironing_support && config->opt_bool("support_ironing");
-    for (auto el : {"support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing" })
+    for (auto el : {"support_ironing_pattern", "support_ironing_flow", "support_ironing_spacing", "support_ironing_filament" })
         toggle_line(el, has_support_ironing);
     // Orca: Force solid support interface when using support ironing
     toggle_field("support_interface_spacing", have_support_material && have_support_interface && !has_support_ironing);
@@ -1010,7 +1045,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
                  have_support_material && ((!support_is_normal_tree || support_style == smsTreeHybrid) || have_raft));
 
     bool has_ironing = (config->opt_enum<IroningType>("ironing_type") != IroningType::NoIroning);
-    for (auto el : { "ironing_pattern", "ironing_flow", "ironing_spacing", "ironing_angle", "ironing_inset", "ironing_angle_fixed" })
+    for (auto el : { "ironing_pattern", "ironing_flow", "ironing_spacing", "ironing_angle", "ironing_inset", "ironing_angle_fixed", "ironing_filament" })
         toggle_line(el, has_ironing);
     bool has_rectilinear_ironing = (config->opt_enum<InfillPattern>("ironing_pattern") == InfillPattern::ipRectilinear);
     for (auto el : {"ironing_angle", "ironing_angle_fixed"})
@@ -1045,7 +1080,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("preheat_steps", have_ooze_prevention && (preheat_steps > 0));
 
     bool have_prime_tower = config->opt_bool("enable_prime_tower");
-    for (auto el : {"prime_tower_width", "prime_tower_brim_width", "prime_tower_skip_points", "wipe_tower_wall_type", "prime_tower_infill_gap","prime_tower_enable_framework", "enable_tower_interface_features"})
+    for (auto el : {"prime_tower_width", "prime_tower_brim_width", "prime_tower_brim_object_gap", "prime_tower_brim_flow_ratio", "prime_tower_skip_points", "wipe_tower_wall_type", "prime_tower_infill_gap","prime_tower_enable_framework", "enable_tower_interface_features"})
         toggle_line(el, have_prime_tower);
 
     toggle_line("enable_tower_interface_cooldown_during_tower",
@@ -1055,14 +1090,26 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     for (auto el : {"wipe_tower_rotation_angle", "wipe_tower_cone_angle",
                     "wipe_tower_extra_spacing", "wipe_tower_max_purge_speed",
-                    "wipe_tower_bridging", "wipe_tower_extra_flow",
-                    "wipe_tower_no_sparse_layers"})
+                    "prime_tower_acceleration",
+                    "wipe_tower_bridging", "wipe_tower_extra_flow"})
             toggle_line(el, have_prime_tower && supports_wipe_tower_2);
+
+    // Orca: both tower generators skip sparse layers, so this is not a wipe tower 2 exclusive.
+    toggle_line("wipe_tower_no_sparse_layers", have_prime_tower);
+    toggle_line("wipe_tower_use_first_layer_height",
+                have_prime_tower && supports_wipe_tower_2 && config->opt_bool("wipe_tower_no_sparse_layers"));
 
     // Orca: the multimaterial tower splits the tower footprint into a shell and a core region,
     // which only the rectangular wall provides; it is generated by WipeTower2 only.
     const bool have_multimaterial_tower = config->opt_bool("prime_tower_multimaterial");
-    toggle_line("prime_tower_multimaterial", have_prime_tower && supports_wipe_tower_2);
+    const bool have_independent_towers  = config->opt_bool("prime_tower_independent");
+    toggle_line("prime_tower_multimaterial", have_prime_tower && supports_wipe_tower_2 && !have_independent_towers);
+    toggle_line("prime_tower_independent", have_prime_tower && supports_wipe_tower_2 && !have_multimaterial_tower);
+    const bool independent_active = have_prime_tower && supports_wipe_tower_2 && have_independent_towers && !have_multimaterial_tower;
+    toggle_line("prime_tower_group_by_material", independent_active);
+    toggle_line("prime_tower_independent_full_height", independent_active);
+    // Dropping the sparse layers outright leaves nothing to combine, so the two are exclusive.
+    toggle_line("wipe_tower_sparse_layers_combination", have_prime_tower && !config->opt_bool("wipe_tower_no_sparse_layers"));
 
     WipeTowerWallType wipe_tower_wall_type = config->opt_enum<WipeTowerWallType>("wipe_tower_wall_type");
     bool have_rib_wall = (wipe_tower_wall_type == WipeTowerWallType::wtwRib)&&have_prime_tower;
@@ -1074,6 +1121,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_field("wipe_tower_wall_type", !(have_prime_tower && supports_wipe_tower_2 && have_multimaterial_tower));
 
     toggle_line("single_extruder_multi_material_priming", !bSEMM && have_prime_tower && supports_wipe_tower_2);
+
+    bool use_cyclic_ordering = config->opt_enum<ToolChangeOrderingType>("toolchange_ordering") == ToolChangeOrderingType::Cyclic;
+    toggle_line("toolchange_cyclic_order", use_cyclic_ordering);
+    toggle_line("toolchange_cyclic_first_layer", use_cyclic_ordering);
 
     toggle_line("prime_volume",have_prime_tower && (!purge_in_primetower || !bSEMM));
 
@@ -1124,6 +1175,9 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     auto is_role_based_wipe_speed = config->opt_bool("role_based_wipe_speed");
     toggle_field("wipe_speed",!is_role_based_wipe_speed);
 
+    const bool have_wipe_inward = config->opt_bool("wipe_inward");
+    toggle_line("wipe_inward_distance", have_wipe_inward);
+
     for (auto el : {"accel_to_decel_enable", "accel_to_decel_factor"})
         toggle_line(el, gcf_is_klipper);
     if(gcf_is_klipper)
@@ -1145,6 +1199,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     bool has_detect_overhang_wall = config->opt_bool("detect_overhang_wall");
     bool has_overhang_reverse     = config->opt_bool("overhang_reverse");
     bool allow_overhang_reverse   = !has_spiral_vase;
+    toggle_line("unsupported_wall_last", has_detect_overhang_wall);
     toggle_line("overhang_reverse", allow_overhang_reverse);
     toggle_line("overhang_reverse_internal_only", allow_overhang_reverse && has_overhang_reverse);
     bool has_overhang_reverse_internal_only = config->opt_bool("overhang_reverse_internal_only");
@@ -1301,15 +1356,15 @@ int ConfigManipulation::show_spiral_mode_settings_dialog(bool is_object_config)
     return answer;
 }
 
-bool ConfigManipulation::get_temperature_range(DynamicPrintConfig *config, int &range_low, int &range_high)
+bool ConfigManipulation::get_temperature_range(DynamicPrintConfig *config, int &range_low, int &range_high, unsigned int variant_index)
 {
     bool range_low_exist = false, range_high_exist = false;
     if (config->has("nozzle_temperature_range_low")) {
-        range_low       = config->opt_int("nozzle_temperature_range_low", (unsigned int) 0);
+        range_low       = config->opt_int("nozzle_temperature_range_low", variant_index);
         range_low_exist       = true;
     }
     if (config->has("nozzle_temperature_range_high")) {
-        range_high       = config->opt_int("nozzle_temperature_range_high", (unsigned int) 0);
+        range_high       = config->opt_int("nozzle_temperature_range_high", variant_index);
         range_high_exist       = true;
     }
     return range_low_exist && range_high_exist;

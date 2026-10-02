@@ -15,6 +15,8 @@
 #include <boost/nowide/fstream.hpp>
 #include <nlohmann/json.hpp>
 
+#include <sstream>
+
 using namespace Slic3r;
 
 SCENARIO("Generic config validation performs as expected.", "[Config]") {
@@ -486,6 +488,77 @@ TEST_CASE("save_to_json round-trips plugin capability references as strings", "[
     REQUIRE(reloaded.load_from_json(tmp.string(), substitutions, true, key_values, reason) == 0);
     CHECK(reason.empty());
     CHECK(reloaded.option<ConfigOptionStrings>("slicing_pipeline_plugin")->values == refs);
+}
+
+TEST_CASE("load_from_json hands a preset's include list to the caller instead of the config", "[Config]") {
+    ScopedTemporaryFile tmp(".json");
+    {
+        boost::nowide::ofstream ofs(tmp.string());
+        ofs << R"({"type":"machine","name":"P","instantiation":"true","include":["T start","T end"],"machine_end_gcode":"M84"})";
+    }
+    DynamicPrintConfig config;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+    std::map<std::string, std::string> key_values;
+    std::string reason;
+    REQUIRE(config.load_from_json(tmp.string(), substitutions, false, key_values, reason) == 0);
+    CHECK(reason.empty());
+    CHECK(key_values["include"] == R"(["T start","T end"])");
+    CHECK_FALSE(config.has("include"));
+    CHECK(substitutions.unrecogized_keys.empty());
+    CHECK(config.opt_string("machine_end_gcode") == "M84");
+}
+
+TEST_CASE("save_to_json writes the same document to a stream as to a file", "[Config]") {
+    DynamicPrintConfig config;
+    config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+    config.set_key_value("wall_loops", new ConfigOptionInt(3));
+    config.set_key_value("filament_type", new ConfigOptionStrings({ "PLA", "PETG" }));
+    config.set_key_value("machine_start_gcode", new ConfigOptionString("G28\nG1 Z5"));
+
+    ScopedTemporaryFile tmp(".json");
+    config.save_to_json(tmp.string(), "test_preset", "User", "1.0.0.0");
+    std::string file_contents;
+    {
+        boost::nowide::ifstream ifs(tmp.string());
+        file_contents.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+    }
+    // The file format: one tab per nesting level and a trailing newline.
+    REQUIRE_FALSE(file_contents.empty());
+    CHECK(file_contents.rfind("{\n\t\"", 0) == 0);
+    CHECK(file_contents.back() == '\n');
+
+    std::ostringstream strict, replaced;
+    config.save_to_json(strict, "test_preset", "User", "1.0.0.0");
+    config.save_to_json(replaced, "test_preset", "User", "1.0.0.0", true);
+    CHECK(strict.str() == file_contents);
+    CHECK(replaced.str() == file_contents);
+    CHECK(nlohmann::json::parse(strict.str())["machine_start_gcode"] == "G28\nG1 Z5");
+}
+
+TEST_CASE("save_to_json replaces invalid UTF-8 in a stream only when asked", "[Config]") {
+    DynamicPrintConfig config;
+    config.set_key_value("machine_start_gcode", new ConfigOptionString("G28 ; \xff"));
+
+    std::ostringstream strict, replaced;
+    CHECK_THROWS_AS(config.save_to_json(strict, "test_preset", "User", "1.0.0.0"), nlohmann::json::type_error);
+    REQUIRE_NOTHROW(config.save_to_json(replaced, "test_preset", "User", "1.0.0.0", true));
+    CHECK(nlohmann::json::parse(replaced.str())["machine_start_gcode"] == "G28 ; \xEF\xBF\xBD");
+}
+
+TEST_CASE("save_to_json leaves an existing file untouched when the config cannot be serialized", "[Config]") {
+    DynamicPrintConfig config;
+    config.set_key_value("machine_start_gcode", new ConfigOptionString("G28 ; \xff"));
+
+    ScopedTemporaryFile tmp(".json");
+    {
+        boost::nowide::ofstream ofs(tmp.string());
+        ofs << "previous";
+    }
+    CHECK_THROWS_AS(config.save_to_json(tmp.string(), "test_preset", "User", "1.0.0.0"), nlohmann::json::type_error);
+
+    boost::nowide::ifstream ifs(tmp.string());
+    const std::string contents((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    CHECK(contents == "previous");
 }
 
 TEST_CASE("plugin capability references survive string-map serialization", "[Config][plugins]") {
@@ -1160,4 +1233,129 @@ TEST_CASE("min_object_distance yields no floor when an FFF config lacks the opti
         c.set_key_value("extruder_clearance_radius", new ConfigOptionFloat(12.));
         CHECK_THAT(min_object_distance(c), Catch::Matchers::WithinAbs(12., 1e-9));
     }
+}
+
+TEST_CASE("Static print configs compare, order and hash by their option values", "[Config]")
+{
+    // PrintObjectConfig comes from PRINT_CONFIG_CLASS_DEFINE; PrintConfig combines MachineEnvelopeConfig
+    // and GCodeConfig through PRINT_CONFIG_CLASS_DERIVED_DEFINE. Both generate hash(), operator==,
+    // operator< and the option registration from the same option list. The hash inequalities use fixed
+    // inputs, so they are deterministic; they check that hash() covers the changed option.
+    SECTION("default-constructed configs are equal and find their options by key")
+    {
+        PrintObjectConfig a, b;
+        REQUIRE(a == b);
+        REQUIRE(a.hash() == b.hash());
+        REQUIRE_FALSE(a < b);
+        REQUIRE_FALSE(b < a);
+        REQUIRE(a.optptr("layer_height") == &a.layer_height);
+        REQUIRE(a.optptr("brim_object_gap") == &a.brim_object_gap);
+    }
+
+    SECTION("one differing option makes the configs unequal and orders them")
+    {
+        PrintObjectConfig a, b;
+        b.layer_height.value = a.layer_height.value + 0.05;
+        REQUIRE(a != b);
+        REQUIRE(a.hash() != b.hash());
+        REQUIRE(a < b);
+        REQUIRE_FALSE(b < a);
+    }
+
+    SECTION("ordering is decided by the first option in declaration order that differs")
+    {
+        PrintObjectConfig a, b;
+        a.brim_object_gap.value = b.brim_object_gap.value + 1.0;  // declared first
+        a.layer_height.value    = b.layer_height.value - 0.05;    // declared later, points the other way
+        REQUIRE(b < a);
+        REQUIRE_FALSE(a < b);
+    }
+
+    SECTION("a derived config sees differences in its parents and in its own options")
+    {
+        PrintConfig a, b;
+        REQUIRE(a == b);
+        REQUIRE(a.hash() == b.hash());
+
+        b.gcode_flavor.value = b.gcode_flavor.value == gcfMarlinLegacy ? gcfKlipper : gcfMarlinLegacy;  // GCodeConfig parent
+        REQUIRE(a != b);
+        REQUIRE(a.hash() != b.hash());
+
+        PrintConfig c, d;
+        d.skirt_distance.value = c.skirt_distance.value + 1.0;  // PrintConfig's own list
+        REQUIRE(c != d);
+        REQUIRE(c.hash() != d.hash());
+        REQUIRE(c.optptr("skirt_distance") == &c.skirt_distance);
+        REQUIRE(c.optptr("gcode_flavor") == &c.gcode_flavor);
+    }
+}
+
+namespace {
+
+// Keys whose values differ between two full configs, compared as text so enum names count too.
+std::vector<std::string> differing_keys(const FullPrintConfig &a, const FullPrintConfig &b)
+{
+    std::vector<std::string> keys;
+    for (const std::string &key : a.keys())
+        if (a.opt_serialize(key) != b.opt_serialize(key))
+            keys.push_back(key);
+    return keys;
+}
+
+// Applies source to one full config member by member and to another key by key, as apply() did before
+// static configs could apply themselves.
+template<class Source> void check_member_apply_matches_key_apply(const Source &source)
+{
+    FullPrintConfig by_member;
+    FullPrintConfig by_key;
+    by_member.apply(source);
+    by_key.apply_only(source, source.keys());
+    CHECK(differing_keys(by_member, by_key).empty());
+    CHECK_FALSE(differing_keys(by_member, FullPrintConfig()).empty());
+}
+
+} // namespace
+
+TEST_CASE("A static config applies itself onto a config of its type as a lookup by name would", "[Config]")
+{
+    SECTION("region config")
+    {
+        PrintRegionConfig region;
+        region.sparse_infill_pattern.value = ipGyroid;
+        region.outer_wall_speed.values     = {37.};
+        region.sparse_infill_density.value = 35.;
+        FullPrintConfig full;
+        REQUIRE(region.apply_to(full));
+        check_member_apply_matches_key_apply(region);
+    }
+    SECTION("object config")
+    {
+        PrintObjectConfig object;
+        object.seam_position.value  = spRear;
+        object.wall_generator.value = PerimeterGeneratorType::Arachne;
+        object.support_speed.values = {33.};
+        object.enable_support.value = true;
+        FullPrintConfig full;
+        REQUIRE(object.apply_to(full));
+        check_member_apply_matches_key_apply(object);
+    }
+    SECTION("G-code config, whose enum lists carry their names through a keys map")
+    {
+        GCodeConfig gcode;
+        gcode.z_hop_types.values       = {int(zhtSpiral)};
+        gcode.retraction_length.values = {1.5};
+        FullPrintConfig full;
+        REQUIRE(gcode.apply_to(full));
+        check_member_apply_matches_key_apply(gcode);
+    }
+}
+
+TEST_CASE("A static config applied onto a config of another type falls back to a lookup by name", "[Config]")
+{
+    PrintRegionConfig region;
+    region.sparse_infill_pattern.value = ipGyroid;
+    DynamicPrintConfig dynamic;
+    REQUIRE_FALSE(region.apply_to(dynamic));
+    dynamic.apply(region);
+    CHECK(dynamic.opt_serialize("sparse_infill_pattern") == "gyroid");
 }

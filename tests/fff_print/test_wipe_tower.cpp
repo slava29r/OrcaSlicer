@@ -1,9 +1,12 @@
 #include <catch2/catch_all.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -11,6 +14,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCode/WipeTower.hpp"
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
 #include "test_helpers.hpp"
@@ -312,6 +316,119 @@ TEST_CASE("A single-filament plate reserves a tower only when one is actually pr
     }
 }
 
+// Filament 2 on the top surface only, so every layer below it is a toolchange-free tower layer: the
+// run "Combine sparse layers" folds. The two heights decide whether anything folds, so they are the
+// caller's business.
+static DynamicPrintConfig sparse_run_config(double layer_height, const char *max_layer_height, bool combine)
+{
+    DynamicPrintConfig config = multifilament_config(2, {
+        { "top_surface_filament_id",        2     },
+        { "enable_prime_tower",             true  },
+        { "wipe_tower_x",                   50    }, // inside the 200x200 test bed
+        { "wipe_tower_y",                   50    },
+        { "prime_tower_width",              35    },
+        { "min_layer_height",               "0.08"},
+        { "single_extruder_multi_material", true  },
+        { "timelapse_type",                 "0"   },
+        { "enable_wrapping_detection",      false },
+        { "raft_layers",                    "0"   } });
+    // A taller first layer would top the plan and hide what the run does, so slice at one height.
+    config.set_deserialize_strict({ { "layer_height",               std::to_string(layer_height) },
+                                    { "initial_layer_print_height", std::to_string(layer_height) },
+                                    { "max_layer_height", max_layer_height },
+                                    { "wipe_tower_sparse_layers_combination", combine ? "1" : "0" } });
+    return config;
+}
+
+// What a sliced tower did with its sparse run.
+struct SparseRunResult { size_t planned, sparse, folded; float tallest_printed, printed_height; std::string gcode; };
+
+static SparseRunResult slice_sparse_run(const DynamicPrintConfig &config)
+{
+    Print print;
+    Model model;
+    init_print({ cube(10) }, print, model, config);
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.is_step_done(psWipeTower));
+
+    SparseRunResult r{};
+    for (const std::vector<WipeTower::ToolChangeResult> &layer : print.wipe_tower_data().tool_changes) {
+        if (layer.empty())
+            continue;
+        ++r.planned;
+        if (wipe_tower_layer_is_sparse(layer))
+            ++r.sparse;
+        if (wipe_tower_layer_is_combined_away(layer)) {
+            ++r.folded;
+        } else {
+            r.tallest_printed = std::max(r.tallest_printed, layer.front().layer_height);
+            r.printed_height += layer.front().layer_height;
+        }
+    }
+    r.gcode = Slic3r::Test::gcode(print);
+    return r;
+}
+
+// How often the G-code declares `height` in the tag this printer's processor reads. The dialect is a
+// global the exporter sets from the printer, so this is only correct after a slice - the point below.
+static size_t count_height_tags(const std::string &gcode, const char *height)
+{
+    const std::string tag = ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height) + height + "\n";
+    size_t n = 0;
+    for (size_t p = gcode.find(tag); p != std::string::npos; p = gcode.find(tag, p + 1))
+        ++n;
+    return n;
+}
+
+TEST_CASE("Combining sparse layers folds a run into whole layers the nozzle can lay down", "[WipeTower]")
+{
+    // 0.1 mm layers under a 0.32 mm cap: three fit (0.3), a fourth does not, so a run prints once
+    // every three layers at 0.3 mm.
+    const SparseRunResult plain    = slice_sparse_run(sparse_run_config(0.1, "0.32", false));
+    const SparseRunResult combined = slice_sparse_run(sparse_run_config(0.1, "0.32", true));
+
+    REQUIRE(plain.planned == combined.planned); // the plan still has one layer per object layer
+    REQUIRE(plain.sparse > 10);
+    CHECK(plain.folded == 0);
+    CHECK_THAT(plain.tallest_printed, Catch::Matchers::WithinAbs(0.1f, 1e-4f));
+
+    CHECK(combined.folded > 0);
+    CHECK_THAT(combined.tallest_printed, Catch::Matchers::WithinAbs(0.3f, 1e-4f));
+    // Two of every three sparse layers fold away, leaving the toolchange layers untouched.
+    CHECK(combined.folded <= plain.sparse);
+    CHECK(combined.folded >= plain.sparse / 2);
+    // What folds away comes back as height on the layer that prints the run: no gap, nothing twice.
+    CHECK_THAT(combined.printed_height, Catch::Matchers::WithinAbs(plain.printed_height, 1e-3f));
+}
+
+TEST_CASE("A run too thin to reach the nozzle's layer height is left alone", "[WipeTower]")
+{
+    // Only whole layers merge, so two 0.2 mm layers (0.4) do not fit a 0.32 mm maximum and the tower
+    // prints as if the option were off. This is the common 0.4 nozzle case; the tooltip says so.
+    const SparseRunResult plain    = slice_sparse_run(sparse_run_config(0.2, "0.32", false));
+    const SparseRunResult combined = slice_sparse_run(sparse_run_config(0.2, "0.32", true));
+
+    REQUIRE(plain.sparse > 10);
+    CHECK(combined.folded == 0);
+    CHECK(combined.planned == plain.planned);
+    CHECK_THAT(combined.tallest_printed, Catch::Matchers::WithinAbs(0.2f, 1e-4f));
+}
+
+TEST_CASE("A merged tower layer declares its own height to the G-code processor", "[WipeTower]")
+{
+    // Each writer declares a height in a hardcoded tag dialect while the processor reads only its
+    // printer's, so one of them is always dropped. A merged layer is the first time that shows, as a
+    // thick layer drawn and costed as a thin one. 0.2 mm layers under a 0.42 mm maximum merge in pairs.
+    const SparseRunResult plain    = slice_sparse_run(sparse_run_config(0.2, "0.42", false));
+    const SparseRunResult combined = slice_sparse_run(sparse_run_config(0.2, "0.42", true));
+
+    REQUIRE(combined.folded > 0);
+    CHECK_THAT(combined.tallest_printed, Catch::Matchers::WithinAbs(0.4f, 1e-4f));
+    // Every layer that prints a merged run has to say so, and nothing may say so without the option.
+    CHECK(count_height_tags(combined.gcode, "0.4") - count_height_tags(plain.gcode, "0.4") == combined.folded);
+}
+
 TEST_CASE("A tower printed without a tool change is still validated against the bed", "[WipeTower]")
 {
     // Wrapping detection prints a tower on a plate that purges one filament. Neither the old
@@ -562,6 +679,53 @@ TEST_CASE("The prime tower keeps its brim when sparse layers are skipped", "[Wip
     }
 }
 
+TEST_CASE("No sparse layers can print the first tower layer at the print's first layer height", "[WipeTower]")
+{
+    // No sparse layers drops the plan's first (often sparse) entries, so the first layer
+    // that actually prints is a later object layer at layer_height. The option reprints
+    // that layer at initial_layer_print_height so the tower still sits on a first-layer bead.
+    const double first_h = 0.25;
+    const double layer_h = 0.10;
+    const bool   use_first     = GENERATE(false, true);
+    const bool   multimaterial = GENERATE(false, true);
+    DYNAMIC_SECTION("use first layer height " << (use_first ? "on" : "off")
+                    << ", multimaterial tower " << (multimaterial ? "on" : "off")) {
+        DynamicPrintConfig config = multimaterial_tower_config(multimaterial);
+        config.set_deserialize_strict({
+            { "wipe_tower_no_sparse_layers",       "1" },
+            { "wipe_tower_use_first_layer_height", use_first ? "1" : "0" },
+            { "initial_layer_print_height",        first_h },
+            { "layer_height",                      layer_h },
+            { "top_surface_filament_id",           1 },
+            { "bottom_surface_filament_id",        1 },
+            { "outer_wall_filament_id",            1 },
+            { "inner_wall_filament_id",            1 },
+            { "internal_solid_filament_id",        1 },
+            { "sparse_infill_filament_id",         2 },
+        });
+
+        Print print;
+        Model model;
+        slice_prime_tower(config, print, model);
+
+        const WipeTowerData &data = print.wipe_tower_data();
+        REQUIRE(data.tool_changes.size() > 1);
+        REQUIRE(std::any_of(data.tool_changes.begin(), data.tool_changes.end(), tower_layer_is_sparse));
+
+        float printed_h = 0.f;
+        bool  found     = false;
+        for (const std::vector<WipeTower::ToolChangeResult> &layer : data.tool_changes) {
+            if (tower_layer_is_sparse(layer))
+                continue;
+            printed_h = layer.front().layer_height;
+            found     = true;
+            break;
+        }
+        REQUIRE(found);
+        CHECK_THAT(printed_h, Catch::Matchers::WithinAbs(use_first ? first_h : layer_h, 1e-4));
+    }
+}
+
 TEST_CASE("The multimaterial prime tower is rejected for more than two filaments", "[WipeTower]")
 {
     // Three filaments would need nested rings; the generator only lays out the two regions, so
@@ -587,4 +751,323 @@ TEST_CASE("The multimaterial prime tower is rejected for more than two filaments
     REQUIRE(print.extruders().size() == 3);
     REQUIRE(print.has_wipe_tower());
     CHECK_THAT(print.validate().string, Catch::Matchers::ContainsSubstring("exactly two filaments"));
+}
+
+TEST_CASE("Prime tower brim object gap is added outside the tower wall", "[WipeTower]")
+{
+    const bool multimaterial = GENERATE(false, true);
+    DYNAMIC_SECTION("multimaterial tower " << (multimaterial ? "on" : "off")) {
+        auto brim_width = [&](const char *gap) {
+            DynamicPrintConfig config = multimaterial_tower_config(multimaterial);
+            config.set_deserialize_strict({
+                { "prime_tower_brim_width",      "5" },
+                { "prime_tower_brim_object_gap", gap },
+            });
+            Print print;
+            Model model;
+            slice_prime_tower(config, print, model);
+            return print.wipe_tower_data().brim_width;
+        };
+        CHECK(brim_width("1") > brim_width("0") + 0.5f);
+        CHECK(brim_width("-1") + 0.5f < brim_width("0"));
+    }
+}
+
+TEST_CASE("Prime tower brim flow ratio scales brim extrusion", "[WipeTower]")
+{
+    auto brim_e = [](const char *ratio) {
+        DynamicPrintConfig config = multimaterial_tower_config(false);
+        config.set_deserialize_strict({
+            { "prime_tower_brim_width",       "5" },
+            { "prime_tower_brim_flow_ratio",  ratio },
+        });
+        const std::string gcode_str = slice_with_prime_tower(config);
+        bool   in_brim = false;
+        double e       = 0;
+        GCodeReader parser;
+        parser.parse_buffer(gcode_str, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            if (line.raw().find("WIPE_TOWER_BRIM_START") != std::string::npos)
+                in_brim = true;
+            else if (line.raw().find("WIPE_TOWER_BRIM_END") != std::string::npos)
+                in_brim = false;
+            else if (in_brim && line.extruding(self))
+                e += line.dist_E(self);
+        });
+        return e;
+    };
+    const double full = brim_e("1");
+    const double half = brim_e("0.5");
+    REQUIRE(full > 0);
+    CHECK_THAT(half / full, Catch::Matchers::WithinAbs(0.5, 0.1));
+}
+
+TEST_CASE("The multimaterial prime tower names the rammed filament and points at ramming", "[WipeTower]")
+{
+    DynamicPrintConfig config = multimaterial_tower_config(true);
+    config.set_key_value("filament_type", new ConfigOptionStrings{"PLA", "PETG"});
+    config.set_key_value("filament_multitool_ramming", new ConfigOptionBools{false, true});
+
+    Print print;
+    Model model;
+    init_print({ cube(10) }, print, model, config);
+    print.apply(model, config);
+    const StringObjectException err = print.validate();
+    CHECK(err.opt_key == "filament_multitool_ramming");
+    CHECK_THAT(err.string, Catch::Matchers::ContainsSubstring("PETG"));
+    CHECK_THAT(err.string, Catch::Matchers::ContainsSubstring("#2"));
+}
+
+static DynamicPrintConfig independent_tower_config()
+{
+    DynamicPrintConfig config = multimaterial_tower_config(false);
+    config.set_deserialize_strict({ { "prime_tower_independent", "1" } });
+    return config;
+}
+
+TEST_CASE("Independent prime towers create one tower per used filament", "[WipeTower]")
+{
+    Print print;
+    Model model;
+    slice_prime_tower(independent_tower_config(), print, model);
+    const WipeTowerData &data = print.wipe_tower_data();
+    REQUIRE(data.independent_towers.size() == 2);
+    CHECK(data.independent_towers[0].filament_id != data.independent_towers[1].filament_id);
+    CHECK((data.independent_towers[0].pos - data.independent_towers[1].pos).norm() > 5.f);
+
+    std::set<int> filaments;
+    size_t        tagged = 0;
+    for (const std::vector<WipeTower::ToolChangeResult> &layer : data.tool_changes)
+        for (const WipeTower::ToolChangeResult &tcr : layer) {
+            REQUIRE(tcr.has_tower_pos);
+            filaments.insert(tcr.tower_filament);
+            ++tagged;
+        }
+    CHECK(tagged > 0);
+    CHECK(filaments.size() == 2);
+}
+
+TEST_CASE("Independent tower auto layout wraps instead of leaving the bed", "[WipeTower]")
+{
+    const float spacing = 60.f;
+    const Vec2f base(150.f, 150.f);
+    const Vec2f p0 = independent_wipe_tower_layout_pos(base, 0, spacing, 200.f, 200.f, 35.f, 35.f, 8.f);
+    const Vec2f p1 = independent_wipe_tower_layout_pos(base, 1, spacing, 200.f, 200.f, 35.f, 35.f, 8.f);
+    CHECK(p0.x() + 35.f <= 200.f);
+    CHECK(p0.y() + 35.f <= 200.f);
+    CHECK(p1.x() + 35.f <= 200.f);
+    CHECK(p1.y() + 35.f <= 200.f);
+    CHECK(p0.x() >= 0.f);
+    CHECK(p0.y() >= 0.f);
+    CHECK(p1.x() >= 0.f);
+    CHECK(p1.y() >= 0.f);
+    CHECK((p0 - p1).norm() > 5.f);
+}
+
+TEST_CASE("Independent prime towers stay inside the printable area", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "wipe_tower_x", "150" }, { "wipe_tower_y", "150" } });
+    Print print;
+    Model model;
+    slice_prime_tower(config, print, model);
+    const WipeTowerData &data = print.wipe_tower_data();
+    REQUIRE(data.independent_towers.size() == 2);
+    const BoundingBox bed = get_extents(print.get_extruder_shared_printable_polygon());
+    for (const WipeTowerData::IndependentTower &tower : data.independent_towers) {
+        const float brim = std::max(tower.brim_width, 0.f);
+        CHECK(unscaled(bed.min.x()) - 1. <= tower.pos.x() - brim);
+        CHECK(unscaled(bed.min.y()) - 1. <= tower.pos.y() - brim);
+        CHECK(tower.pos.x() + tower.width + brim <= unscaled(bed.max.x()) + 1.);
+        CHECK(tower.pos.y() + tower.depth + brim <= unscaled(bed.max.y()) + 1.);
+    }
+}
+
+TEST_CASE("Independent prime towers keep the stock tower when the option is off", "[WipeTower]")
+{
+    Print print;
+    Model model;
+    slice_prime_tower(multimaterial_tower_config(false), print, model);
+    CHECK(print.wipe_tower_data().independent_towers.empty());
+}
+
+TEST_CASE("Independent prime towers cannot be combined with the multimaterial tower", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "prime_tower_multimaterial", "1" } });
+    Print print;
+    Model model;
+    init_print({ cube(10) }, print, model, config);
+    print.apply(model, config);
+    const StringObjectException err = print.validate();
+    CHECK(err.opt_key == "prime_tower_independent");
+}
+
+TEST_CASE("Independent prime towers honour a stored position after slicing", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_key_value("independent_wipe_tower_x", new ConfigOptionFloatsNullable{ 20., 90. });
+    config.set_key_value("independent_wipe_tower_y", new ConfigOptionFloatsNullable{ 30., 40. });
+    Print print;
+    Model model;
+    slice_prime_tower(config, print, model);
+    const WipeTowerData &data = print.wipe_tower_data();
+    REQUIRE(data.independent_towers.size() == 2);
+    bool saw_first = false;
+    bool saw_second = false;
+    for (const WipeTowerData::IndependentTower &tower : data.independent_towers) {
+        if (tower.filament_id == 0) {
+            CHECK_THAT(tower.pos.x(), Catch::Matchers::WithinAbs(20.f, 1.f));
+            CHECK_THAT(tower.pos.y(), Catch::Matchers::WithinAbs(30.f, 1.f));
+            saw_first = true;
+        } else if (tower.filament_id == 1) {
+            CHECK_THAT(tower.pos.x(), Catch::Matchers::WithinAbs(90.f, 1.f));
+            CHECK_THAT(tower.pos.y(), Catch::Matchers::WithinAbs(40.f, 1.f));
+            saw_second = true;
+        }
+    }
+    CHECK(saw_first);
+    CHECK(saw_second);
+}
+
+TEST_CASE("Independent wipe tower holes serialize without throwing Serializing NaN", "[WipeTower]")
+{
+    ConfigOptionFloatsNullable stored;
+    stored.values = { std::numeric_limits<double>::quiet_NaN(), 20. };
+    std::string text;
+    REQUIRE_NOTHROW(text = stored.serialize());
+    CHECK(text.find("nil") != std::string::npos);
+
+    ConfigOptionFloats non_nullable;
+    non_nullable.values = { std::numeric_limits<double>::quiet_NaN(), 1. };
+    REQUIRE_NOTHROW(non_nullable.serialize());
+}
+
+TEST_CASE("Independent prime tower toolchanges stay on their own filament", "[WipeTower]")
+{
+    Print print;
+    Model model;
+    slice_prime_tower(independent_tower_config(), print, model);
+    size_t tagged = 0;
+    for (const std::vector<WipeTower::ToolChangeResult> &layer : print.wipe_tower_data().tool_changes)
+        for (const WipeTower::ToolChangeResult &tcr : layer) {
+            REQUIRE(tcr.has_tower_pos);
+            CHECK(tcr.new_tool == tcr.tower_filament);
+            ++tagged;
+        }
+    CHECK(tagged > 0);
+}
+
+TEST_CASE("Independent prime towers export G-code without an unexpected toolchange", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "wipe_tower_no_sparse_layers", "0" } });
+    Print print;
+    Model model;
+    slice_prime_tower(config, print, model);
+    std::string out;
+    REQUIRE_NOTHROW(out = gcode(print));
+    CHECK_FALSE(out.empty());
+}
+
+TEST_CASE("Independent prime towers change tools before travelling to the next tower", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "wipe_tower_no_sparse_layers", "0" }, { "gcode_comments", "1" } });
+    Print print;
+    Model model;
+    slice_prime_tower(config, print, model);
+    const auto &towers = print.wipe_tower_data().independent_towers;
+    REQUIRE(towers.size() == 2);
+
+    const std::string out = gcode(print);
+    int               last_tool = 0;
+    size_t            checked   = 0;
+    GCodeReader       reader;
+    reader.parse_buffer(out, [&](GCodeReader &r, const GCodeReader::GCodeLine &line) {
+        const char *raw = line.raw().c_str();
+        while (*raw == ' ' || *raw == '\t')
+            ++raw;
+        if (raw[0] == 'T' && std::isdigit(static_cast<unsigned char>(raw[1])))
+            last_tool = std::atoi(raw + 1);
+        if (line.comment().find("Travel to a Wipe Tower") == std::string_view::npos)
+            return;
+        const float x = line.new_X(r);
+        const float y = line.new_Y(r);
+        int         match  = -1;
+        int         nmatch = 0;
+        for (const auto &tower : towers) {
+            const bool on_tower = x >= tower.pos.x() - 1.f && x <= tower.pos.x() + tower.width + 1.f &&
+                                  y >= tower.pos.y() - 1.f && y <= tower.pos.y() + tower.depth + 1.f;
+            if (!on_tower)
+                continue;
+            match = int(tower.filament_id);
+            ++nmatch;
+        }
+        if (nmatch == 1) {
+            CHECK(match == last_tool);
+            ++checked;
+        }
+    });
+    CHECK(checked > 0);
+}
+
+TEST_CASE("Prime tower acceleration is emitted when set", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "prime_tower_acceleration", "500" },
+                                    { "default_acceleration", "10000" },
+                                    { "travel_acceleration", "10000" } });
+    Print print;
+    Model model;
+    slice_prime_tower(config, print, model);
+    const std::string out = gcode(print);
+    int               last_accel    = 0;
+    size_t            tower_blocks  = 0;
+    std::istringstream ss(out);
+    std::string        line;
+    while (std::getline(ss, line)) {
+        if (const auto at = line.find("M204 S"); at != std::string::npos)
+            last_accel = std::atoi(line.c_str() + at + 6);
+        else if (const auto at = line.find("M204 P"); at != std::string::npos)
+            last_accel = std::atoi(line.c_str() + at + 6);
+        else if (const auto at = line.find("ACCEL="); at != std::string::npos)
+            last_accel = std::atoi(line.c_str() + at + 6);
+        if (line.find("CP TOOLCHANGE WIPE") == std::string::npos)
+            continue;
+        CHECK(last_accel == 500);
+        ++tower_blocks;
+    }
+    CHECK(tower_blocks > 0);
+}
+
+TEST_CASE("Independent rib towers at the bed edge stay inside the printable area", "[WipeTower]")
+{
+    DynamicPrintConfig config = independent_tower_config();
+    config.set_deserialize_strict({ { "wipe_tower_wall_type", "rib" },
+                                    { "wipe_tower_extra_rib_length", "10" },
+                                    { "wipe_tower_rib_width", "8" },
+                                    { "wipe_tower_fillet_wall", "1" },
+                                    { "prime_tower_brim_width", "5" },
+                                    { "prime_tower_width", "30" },
+                                    { "printable_area", "0x0,200x0,200x200,0x200" } });
+    config.set_key_value("independent_wipe_tower_x", new ConfigOptionFloatsNullable{ 160., 20. });
+    config.set_key_value("independent_wipe_tower_y", new ConfigOptionFloatsNullable{ 160., 20. });
+    Print print;
+    Model model;
+    REQUIRE_NOTHROW(slice_prime_tower(config, print, model));
+    const Polygons bed = print.get_extruder_shared_printable_polygon();
+    REQUIRE_FALSE(bed.empty());
+    const BoundingBox bed_bb = get_extents(bed);
+    REQUIRE_FALSE(print.wipe_tower_data().independent_towers.empty());
+    for (const auto &tower : print.wipe_tower_data().independent_towers) {
+        REQUIRE(tower.wipe_tower_mesh_data.has_value());
+        Polygon fp = tower.wipe_tower_mesh_data->bottom;
+        fp.translate(Point(scale_(tower.pos.x()), scale_(tower.pos.y())));
+        const BoundingBox bb = get_extents(fp);
+        CHECK(unscaled(bb.max.x()) <= unscaled(bed_bb.max.x()) + 0.2);
+        CHECK(unscaled(bb.max.y()) <= unscaled(bed_bb.max.y()) + 0.2);
+        CHECK(unscaled(bb.min.x()) >= unscaled(bed_bb.min.x()) - 0.2);
+        CHECK(unscaled(bb.min.y()) >= unscaled(bed_bb.min.y()) - 0.2);
+    }
+    CHECK(print.validate().string.find("partially outside") == std::string::npos);
 }

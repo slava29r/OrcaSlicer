@@ -362,6 +362,7 @@ private:
     void 				collect_extruders(const PrintObject &object, const std::vector<std::pair<double, unsigned int>> &per_layer_extruder_switches);
     void 				fill_wipe_tower_partitions(const PrintConfig &config, coordf_t object_bottom_z, coordf_t max_layer_height);
     bool                insert_wipe_tower_extruder();
+    bool                insert_independent_tower_group_extruders();
     void                mark_skirt_layers(const PrintConfig &config, coordf_t max_layer_height);
     void 				collect_extruder_statistics(bool prime_multi_material);
     void                reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer);
@@ -416,6 +417,11 @@ private:
 
     int                        most_used_extruder;
 };
+
+// Parse the user defined cyclic toolchange sequence ("3,2 , 1 , 4") into 0-based filament indices.
+// Out-of-range entries, duplicates and non-numeric tokens are dropped, so a partially valid string
+// still orders the filaments it does name. Exposed for unit testing.
+std::vector<unsigned int> parse_cyclic_order(const std::string& str, unsigned int number_of_extruders);
 
 } // namespace SLic3r
 

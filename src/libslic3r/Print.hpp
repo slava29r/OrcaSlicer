@@ -30,6 +30,8 @@
 
 namespace Slic3r {
 
+class SlicingErrors;
+
 class GCode;
 class Layer;
 class ModelObject;
@@ -468,6 +470,10 @@ public:
     std::vector<Polygons>       slice_support_volumes(const ModelVolumeType model_volume_type) const;
     std::vector<Polygons>       slice_support_blockers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_BLOCKER); }
     std::vector<Polygons>       slice_support_enforcers() const { return this->slice_support_volumes(ModelVolumeType::SUPPORT_ENFORCER); }
+    // Shared slicing path; multiple volumes are united per layer.
+    std::vector<Polygons>       slice_modifier_volumes(const std::vector<const ModelVolume*> &volumes) const;
+    // Keep Precise Seam volumes separate so their individual priority is preserved.
+    std::vector<Polygons>       slice_single_volume(const ModelVolume* volume) const { return this->slice_modifier_volumes({volume}); }
 
     // Helpers to project custom facets on slices
     void project_and_append_custom_facets(bool seam, EnforcerBlockerType type, std::vector<Polygons>& expolys, std::vector<std::pair<Vec3f,Vec3f>>* vertical_points=nullptr) const;
@@ -791,6 +797,25 @@ struct WipeTowerData
     BoundingBoxf                                          bbx;//including brim
     Vec2f                                                 rib_offset;
     std::optional<WipeTowerMeshData>                      wipe_tower_mesh_data;//added rib_offset
+    // Independent Type2 towers: one preview/mesh/position per used filament. Empty when the
+    // option is off, so the rest of the pipeline keeps using the single-tower fields above.
+    struct IndependentTower
+    {
+        // Group id = smallest member filament (0-based); also the index the position is stored under.
+        unsigned int                     filament_id = 0;
+        // Filaments purging into this tower, 0-based, in plate order.
+        std::vector<unsigned int>        members;
+        Vec2f                            pos         = Vec2f::Zero();
+        float                            depth       = 0.f;
+        float                            width       = 0.f;
+        float                            brim_width  = 0.f;
+        float                            height      = 0.f;
+        BoundingBoxf                     bbx;
+        Vec2f                            rib_offset  = Vec2f::Zero();
+        std::vector<std::pair<float, float>> z_and_depth_pairs;
+        std::optional<WipeTowerMeshData> wipe_tower_mesh_data;
+    };
+    std::vector<IndependentTower>                         independent_towers;
     void clear() {
         priming.reset(nullptr);
         tool_changes.clear();
@@ -803,6 +828,7 @@ struct WipeTowerData
         height = 0.f;
         rib_offset = Vec2f::Zero();
         wipe_tower_mesh_data  = std::nullopt;
+        independent_towers.clear();
     }
     void construct_mesh(float width, float depth, float height, float brim_width, bool is_rib_wipe_tower, float rib_width, float rib_length, bool fillet_wall, float cone_angle = 0.f);
 
@@ -828,6 +854,7 @@ struct PrintStatistics
     double                          total_wipe_tower_cost;
     double                          total_wipe_tower_filament;
     unsigned int                    initial_tool;
+    unsigned int                    initial_no_support_tool;
     std::map<size_t, double>        filament_stats;
 
     // Config with the filled in print statistics.
@@ -846,6 +873,7 @@ struct PrintStatistics
         total_wipe_tower_cost  = 0.;
         total_wipe_tower_filament = 0.;
         initial_tool           = 0;
+        initial_no_support_tool = 0;
         filament_stats.clear();
     }
     static const std::string FilamentUsedG;
@@ -905,10 +933,11 @@ enum FilamentTempType {
 
 enum FilamentCompatibilityType {
     Compatible,
-    HighLowMixed,
-    //HighLowMixed,
-    //HighMidMixed,
-    InvalidTemperatureRange
+    HighLowMixed,                        // nozzle temperatures outside mutual recommended ranges (materials compatible/unknown)
+    InvalidTemperatureRange,             // a recommended range has low >= high
+    IncompatibleMaterials,               // materials are known not to bond (e.g. PLA + PETG)
+    PossibleIncompatibleMaterials,       // material bonding unknown, but temperatures are fine
+    HighLowMixedAndPossibleIncompatible  // temperatures mismatched AND material bonding unknown
 };
 
 // The complete print tray with possibly multiple objects.
@@ -967,6 +996,8 @@ public:
 
     // Returns an empty string if valid, otherwise returns an error message.
     StringObjectException validate(std::vector<StringObjectException> *warnings = nullptr, Polygons* collison_polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr) const override;
+    // The per-object messages of a SlicingErrors, each prefixed with its object's name.
+    std::string slicing_errors_message(const SlicingErrors &errors) const;
     double              skirt_first_layer_height() const;
     Flow                brim_flow() const;
     Flow                skirt_flow() const;
@@ -1160,6 +1191,8 @@ public:
 
     //BBS
     static StringObjectException sequential_print_clearance_valid(const Print &print, Polygons *polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr);
+    // Orca: pre-slice clearance check for a prime tower compacted by "No sparse layers".
+    static StringObjectException compacted_wipe_tower_clearance_valid(const Print &print, Polygons *polygons = nullptr, std::vector<std::pair<Polygon, float>>* height_polygons = nullptr);
     ConflictResultOpt            get_conflict_result() const { return m_conflict_result; }
 
     // Return 4 wipe tower corners in the world coordinates (shifted and rotated), including the wipe tower brim.
@@ -1174,6 +1207,8 @@ public:
     void set_calib_params(const Calib_Params& params);
     const Calib_Params& calib_params() const { return m_calib_params; }
     Vec2d translate_to_print_space(const Vec2d &point) const;
+    // Orca: precise counterpart of compacted_wipe_tower_clearance_valid(), run once the tower exists.
+    void                validate_compacted_wipe_tower_clearance() const;
     float               get_wipe_tower_depth() const { return m_wipe_tower_data.depth; }
     BoundingBoxf        get_wipe_tower_bbx() const { return m_wipe_tower_data.bbx; }
     Vec2f               get_rib_offset() const { return m_wipe_tower_data.rib_offset; }
@@ -1187,11 +1222,16 @@ public:
     static FilamentTempType get_filament_temp_type(const std::string& filament_type);
     static int get_hrc_by_nozzle_type(const NozzleType& type);
     static std::vector<std::string> get_incompatible_filaments_by_nozzle(const float nozzle_diameter, const std::optional<NozzleVolumeType> nozzle_volume_type = std::nullopt);
+    // support_only marks entries (parallel to filament_types) that the plate uses solely as a
+    // support base/interface filament. Not bonding to the object is the whole point of such a
+    // filament, so the material-bonding rule is not applied to it; the temperature rules still
+    // are. Pass empty to check every filament as an object material.
     static FilamentCompatibilityType check_multi_filaments_compatibility(
         const std::vector<std::string>& filament_types,
         const std::vector<int>& nozzle_temperatures,
         const std::vector<int>& nozzle_temperature_range_lows,
-        const std::vector<int>& nozzle_temperature_range_highs);
+        const std::vector<int>& nozzle_temperature_range_highs,
+        const std::vector<unsigned char>& support_only = {});
     // similar to check_multi_filaments_compatibility, but the input is int, and may be negative (means unset)
     static bool is_filaments_compatible(const std::vector<int>& types);
     // get the compatible filament type of a multi-material object
@@ -1208,7 +1248,9 @@ public:
 
     // Post-slicing config-slot resolvers: map a (filament, layer) pair to the index of its
     // per-(extruder x volume type) column in the expanded variant arrays, cached by grouping context.
-    int get_filament_config_indx(int filament_id, int layer_id);
+    // Orca: without use_cache, the filament resolver leaves the cache alone, for the G-code export
+    // pipeline's cooling stage, which runs concurrently with the generator stage filling it.
+    int get_filament_config_indx(int filament_id, int layer_id, bool use_cache = true);
     int get_nozzle_config_index(int filament_id, int layer_id);
 
     // Orca: Implement prusa's filament shrink compensation approach
@@ -1268,7 +1310,7 @@ protected:
     };
     using FilamentIndexMap = std::unordered_map<FilamentIndexKey, int, FilamentIndexKeyHash>;
     using PrintIndexMap = std::unordered_map<PrintIndexKey, int, PrintIndexKeyHash>;
-    int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, FilamentIndexMap &index_map);
+    int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, FilamentIndexMap *index_map);
     int get_config_index(int filament_id, int layer_id, const std::vector<std::string> &variant_list, const std::vector<int>& self_index_list, PrintIndexMap &index_map);
 
     // Invalidates the step, and its depending steps in Print.
@@ -1277,6 +1319,8 @@ protected:
 private:
     //BBS
     static StringObjectException check_multi_filament_valid(const Print &print);
+    // The materials fused together inside one object have to bond; see Print.cpp.
+    static StringObjectException check_object_materials_valid(const Print &print);
 
     bool                has_tpu_filament() const;
     bool                invalidate_state_by_config_options(const ConfigOptionResolver &new_config, const std::vector<t_config_option_key> &opt_keys);
@@ -1393,6 +1437,92 @@ public:
     //static float min_skirt_length;
 };
 
+
+// ---------------------------------------------------------------------------------------------
+// Clearance rule for a prime tower compacted by wipe_tower_no_sparse_layers. Shared by the precise
+// check that runs on the real extrusions, the pre-slice estimate that feeds the plater with collision
+// polygons, and the plater's own live preview while the user drags the tower or an object around.
+// Keeping the rule in one place is what stops those three from drifting apart and reporting different
+// things for the same plate.
+// ---------------------------------------------------------------------------------------------
+
+// Half of a clearance distance, the share each of the two outlines carries. Sequential printing splits
+// extruder_clearance_radius between the two object hulls this way; the tower checks split their
+// clearances between the tower ring and the instance hull for the same reason, so that the two
+// outlines the plater draws touch precisely when the check trips. The 0.2 mm comes off first: it is
+// the rounding slack the sequential check applies, 0.1 mm per side.
+inline double compacted_tower_half_clearance(double clearance) { return 0.5 * (clearance - 0.2); }
+
+// Keep-out geometry a compacted tower projects onto the plate, derived from its bare footprint.
+struct CompactedTowerZone
+{
+    // Footprint the checks work on: the raw outline grown by the spiral Z-hop envelope.
+    Polygon     hull;
+    // hull grown by half the toolhead radius; an object whose own half-grown hull reaches into it is
+    // hit by the head body. This is also the ring the plater draws.
+    Polygons    grown_body;
+    // hull grown by half the bare nozzle cone radius, the innermost tier.
+    Polygons    grown_nozzle;
+    // hull bounding box, the Y band the rod sweeps.
+    BoundingBox bbox_rod;
+    // Full body clearance, of which grown_body carries half. Which of the two tiers applies is decided
+    // per object rather than here; see compacted_wipe_tower_clearance().
+    double      body_radius { 0. };
+
+    bool empty() const { return hull.points.empty(); }
+};
+
+// Per-side padding a bare wipe tower outline needs before the clearance checks may treat it as the
+// tower's footprint. Callers whose outline already carries the first-layer brim pass zero for it.
+// Shared by the pre-slice estimate and the plater's live preview: both start from an outline that
+// falls short of the printed tower in the same two ways, and padding them by different amounts is
+// exactly how the preview and the validation behind it would end up disagreeing.
+double compacted_tower_footprint_padding(const PrintConfig &config, double brim_width);
+
+// Grow a bare tower footprint (bed frame, scaled) into its keep-out zone.
+// grow_spiral adds the spiral Z-hop envelope around that one footprint. Independent
+// towers pass false: each tower is its own zone, and the extra envelope would only
+// inflate the rings that already sit around every tower separately.
+CompactedTowerZone compacted_wipe_tower_zone(const PrintConfig &config, const Polygon &tower_footprint, bool grow_spiral = true);
+
+// How far an object may rise above the compacted tower base before the toolhead hits it.
+struct CompactedTowerClearance
+{
+    // Height the object may reach above the tower base. Zero means it may not rise at all.
+    double allowed_rise;
+    // Clearance that applies once the object stands clear of the toolhead in XY, i.e. rod or lid.
+    double far_clearance;
+    // The object sits within the toolhead radius, so the head body limits it rather than the rod.
+    bool   near_body;
+    // Horizontal clearance this particular object has to keep from the tower: the full toolhead
+    // radius once it rises past the nozzle cone, the bare cone while it stays below. It is what the
+    // error message quotes and what the plater grows the object outline by.
+    double body_clearance;
+};
+
+// object_rise is the height above the tower base that the caller is going to compare against
+// allowed_rise. It also selects the horizontal tier, so the two cannot disagree.
+CompactedTowerClearance compacted_wipe_tower_clearance(const PrintConfig &config, const CompactedTowerZone &zone,
+                                                      const Polygon &inst_hull, double object_rise);
+
+// This object was judged on a tier reaching past the bare nozzle cone, so the wide ring is the one its
+// outline has to be drawn against.
+inline bool compacted_tower_body_tier(const CompactedTowerClearance &clearance)
+{
+    return clearance.body_clearance > double(MAX_OUTER_NOZZLE_DIAMETER);
+}
+
+// Keep-out rings to draw around the tower. The nozzle one always applies; the wide body one is drawn
+// only when some object on the plate is actually measured against it, otherwise it would show a
+// keep-out zone no object can violate.
+Polygons compacted_wipe_tower_rings(const CompactedTowerZone &zone, bool any_body_tier);
+
+// Outline to hand the plater for an offending object: the instance hull grown by the same half
+// clearance the check grew it by, which is CompactedTowerClearance::body_clearance for that object.
+// Sequential printing reports its hulls the same way, and it doubles as the fix for the bare hull
+// being unusable on screen, where drawn flat it hides under the object and drawn at the height limit
+// it ends up buried inside the mesh.
+Polygon compacted_wipe_tower_offender_outline(const Polygon &inst_hull, double body_clearance);
 
 } /* slic3r_Print_hpp_ */
 
