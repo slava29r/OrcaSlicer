@@ -1924,9 +1924,10 @@ void PrintConfigDef::init_fff_params()
     def = this->add("brim_object_gap", coFloat);
     def->label = L("Brim-object gap");
     def->category = L("Support");
-    def->tooltip = L("This creates a gap between the innermost brim line and the object and can make the brim easier to remove.");
+    def->tooltip = L("This creates a gap between the innermost brim line and the object and can make the brim easier to remove. "
+                     "A negative value presses the brim into the object.");
     def->sidetext = L("mm");	// millimeters, CIS languages need translation
-    def->min = 0;
+    def->min = -1;
     def->max = 2;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(0.));
@@ -5809,6 +5810,29 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     //BBS: change from 3.0 to 2.0
     def->set_default_value(new ConfigOptionFloat(2.0));
+
+    def = this->add("support_brim_object_gap", coFloat);
+    def->label = L("Brim-object gap");
+    def->category = L("Support");
+    def->tooltip = L("This creates a gap between the innermost brim line of the first support or raft layer and the support itself, and can make the brim easier to remove. "
+                     "A negative value presses the brim into the support. "
+                     "It applies to first-layer expansion and to tree support brim. The model's Brim-object gap is not used here.");
+    def->sidetext = L("mm");	// millimeters, CIS languages need translation
+    def->min = -1;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("support_brim_flow_ratio", coFloat);
+    def->label = L("Brim flow ratio");
+    def->category = L("Support");
+    def->tooltip = L("This factor affects the amount of material for the first raft or support layer (the support brim). "
+                     "The model's Brim flow ratio is not used here.\n\n"
+                     "The actual flow used is calculated by multiplying this value by the filament flow ratio, and if set, the object's flow ratio.");
+    def->min = 0;
+    def->max = 2;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1));
 
     def = this->add("raft_layers", coInt);
     def->label = L("Raft layers");

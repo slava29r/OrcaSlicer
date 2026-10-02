@@ -2,6 +2,8 @@
 
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Polyline.hpp"
 
 #include <cmath>
 #include <map>
@@ -507,5 +509,71 @@ TEST_CASE("Bottom-only support interface keeps the dense interface density", "[S
     });
     SupportParameters sp(*print.objects().front());
     REQUIRE(sp.bottom_interface_density > sp.support_density);
+}
+
+TEST_CASE("Support first-layer expansion brim object gap sits outside the support", "[SupportMaterial]")
+{
+    auto first_layer_span = [](double gap) {
+        Print print;
+        init_and_process_print({ TestMesh::overhang }, print, {
+            { "enable_support",              1 },
+            { "layer_height",                0.2 },
+            { "support_type",                "normal(auto)" },
+            { "support_style",               "grid" },
+            { "support_on_build_plate_only", 1 },
+            { "raft_first_layer_expansion",  4 },
+            { "support_brim_object_gap",     gap },
+            { "brim_type",                   "no_brim" },
+        });
+        REQUIRE_FALSE(print.objects().empty());
+        const auto &layers = print.objects().front()->support_layers();
+        REQUIRE_FALSE(layers.empty());
+        const SupportLayer *sl = layers.front();
+        BoundingBox bb;
+        if (!sl->support_islands.empty())
+            bb = get_extents(sl->support_islands);
+        else if (!sl->lslices.empty())
+            bb = get_extents(sl->lslices);
+        else {
+            Polylines paths;
+            sl->support_fills.collect_polylines(paths);
+            REQUIRE_FALSE(paths.empty());
+            bb = get_extents(paths);
+        }
+        return unscale<double>(bb.size().x());
+    };
+    CHECK(first_layer_span(1.0) > first_layer_span(0.0) + 0.5);
+    CHECK(first_layer_span(-1.0) + 0.5 < first_layer_span(0.0));
+}
+
+TEST_CASE("Support brim flow ratio scales first-layer support extrusion", "[SupportMaterial]")
+{
+    auto first_layer_e = [](double ratio) {
+        const std::string g = slice({ TestMesh::overhang }, {
+            { "enable_support",              1 },
+            { "layer_height",                0.2 },
+            { "support_type",                "normal(auto)" },
+            { "support_style",               "grid" },
+            { "support_on_build_plate_only", 1 },
+            { "raft_first_layer_expansion",  4 },
+            { "support_brim_flow_ratio",     ratio },
+            { "brim_type",                   "no_brim" },
+        });
+        double e = 0;
+        GCodeReader parser;
+        parser.parse_buffer(g, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+            if (self.z() > 0.25)
+                return;
+            if (!line.extruding(self))
+                return;
+            if (line.comment().find("support material") != std::string_view::npos)
+                e += line.dist_E(self);
+        });
+        return e;
+    };
+    const double full = first_layer_e(1.0);
+    const double half = first_layer_e(0.5);
+    REQUIRE(full > 0);
+    CHECK_THAT(half / full, Catch::Matchers::WithinAbs(0.5, 0.15));
 }
 

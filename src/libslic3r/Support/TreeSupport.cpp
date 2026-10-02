@@ -1401,8 +1401,9 @@ void TreeSupport::generate_toolpaths()
     size_t layer_nr = 0;
     for (; layer_nr < m_slicing_params.base_raft_layers; layer_nr++) {
         SupportLayer *ts_layer = m_object->get_support_layer(layer_nr);
-        coordf_t expand_offset = (layer_nr == 0 ? m_object_config->raft_first_layer_expansion.value : 0.);
-        auto raft_areas1 = offset_ex(raft_areas, scale_(expand_offset));
+        auto raft_areas1 = (layer_nr == 0) ?
+            offset_ex_with_brim_gap(raft_areas, object_config.support_brim_object_gap.value, object_config.raft_first_layer_expansion.value) :
+            raft_areas;
 
         Flow support_flow = Flow(support_extrusion_width, ts_layer->height, nozzle_diameter);
         Fill* filler_raft = Fill::new_from_type(ipRectilinear);
@@ -2128,11 +2129,29 @@ void TreeSupport::draw_circles()
                         }
                         if (obj_layer_nr == 0 && m_raft_layers == 0) {
                             double brim_width = !config.tree_support_auto_brim ? tree_brim_width : std::max(MIN_BRANCH_RADIUS_FIRST_LAYER, std::min(node.radius + node.dist_mm_to_top / (scale * branch_radius) * 0.5, MAX_BRANCH_RADIUS_FIRST_LAYER) - node.radius);
-                            auto tmp=offset(circle, scale_(brim_width));
-                            if(!tmp.empty())
-                                circle = tmp[0];
+                            const double gap = config.support_brim_object_gap.value;
+                            if (brim_width > EPSILON) {
+                                Polygons outer = offset(circle, scale_(gap + brim_width));
+                                if (gap > EPSILON) {
+                                    Polygons inner = offset(circle, scale_(gap));
+                                    ExPolygons pieces{ExPolygon(circle)};
+                                    append(pieces, diff_ex(outer, inner));
+                                    area = ExPolygons{};
+                                    const ExPolygons collision = get_collision(node.is_sharp_tail && node.distance_to_top <= 0);
+                                    for (const ExPolygon &piece : pieces)
+                                        append(area, avoid_object_remove_extra_small_parts(piece, collision));
+                                } else if (!outer.empty()) {
+                                    circle = outer[0];
+                                    area = avoid_object_remove_extra_small_parts(ExPolygon(circle), get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
+                                } else {
+                                    area = avoid_object_remove_extra_small_parts(ExPolygon(circle), get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
+                                }
+                            } else {
+                                area = avoid_object_remove_extra_small_parts(ExPolygon(circle), get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
+                            }
+                        } else {
+                            area = avoid_object_remove_extra_small_parts(ExPolygon(circle), get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
                         }
-                        area = avoid_object_remove_extra_small_parts(ExPolygon(circle), get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
                         // area = diff_clipped({ ExPolygon(circle) }, get_collision(node.is_sharp_tail && node.distance_to_top <= 0));
 
                         if (!area.empty()) has_circle_node = true;
@@ -2331,17 +2350,14 @@ void TreeSupport::draw_circles()
                 if (layer_nr == 0 && m_raft_layers == 0 && m_support_params.support_style == smsTreeHybrid &&
                     m_object_config->raft_first_layer_expansion.value > 0.f) {
                     ExPolygons expanded_base_areas;
-                    const float inflate_factor_1st_layer = float(scale_(m_object_config->raft_first_layer_expansion.value));
                     Polygons trimming = offset(m_object->layers().front()->lslices, float(scale_(m_support_params.gap_xy_first_layer)),
                                                SUPPORT_SURFACES_OFFSET_PARAMETERS);
-                    // Orca: Match normal support expansion: grow in steps and re-trim against the object each time.
-                    const int nsteps = std::max(5, int(ceil(inflate_factor_1st_layer / m_support_params.first_layer_flow.scaled_width())));
-                    const float step = inflate_factor_1st_layer / nsteps;
+                    const double gap_mm = m_object_config->support_brim_object_gap.value;
+                    const double expansion_mm = m_object_config->raft_first_layer_expansion.value;
                     for (const ExPolygon &expoly : ts_layer->base_areas) {
                         if (overlaps({ expoly }, area_poly)) { // normal support in Hybrid mode
-                            Polygons expanded = to_polygons(expoly);
-                            for (int i = 0; i < nsteps; ++i)
-                                expanded = diff(expand(expanded, step), trimming);
+                            Polygons expanded = expand_support_first_layer(to_polygons(expoly), gap_mm, expansion_mm, trimming,
+                                                                           float(m_support_params.first_layer_flow.scaled_width()));
                             append(expanded_base_areas, union_ex(expanded));
                         } else
                             expanded_base_areas.emplace_back(expoly);

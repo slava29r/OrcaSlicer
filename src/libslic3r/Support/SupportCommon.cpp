@@ -298,7 +298,6 @@ SupportGeneratorLayersPtr generate_raft_base(
 
     // How much to inflate the support columns to be stable. This also applies to the 1st layer, if no raft layers are to be printed.
     const float inflate_factor_fine      = float(scale_((slicing_params.raft_layers() > 1) ? 0.5 : EPSILON));
-    const float inflate_factor_1st_layer = std::max(0.f, float(scale_(object.config().raft_first_layer_expansion)) - inflate_factor_fine);
     SupportGeneratorLayer       *contacts         = top_contacts         .empty() ? nullptr : top_contacts         .front();
     SupportGeneratorLayer       *interfaces       = interface_layers     .empty() ? nullptr : interface_layers     .front();
     SupportGeneratorLayer       *base_interfaces  = base_interface_layers.empty() ? nullptr : base_interface_layers.front();
@@ -358,7 +357,9 @@ SupportGeneratorLayersPtr generate_raft_base(
             new_layer.height  = slicing_params.first_print_layer_height;
             new_layer.bottom_z = 0.;
             first_layer = union_(std::move(first_layer), base);
-            new_layer.polygons = inflate_factor_1st_layer > 0 ? expand(first_layer, inflate_factor_1st_layer) : first_layer;
+            const double gap_mm = object.config().support_brim_object_gap.value;
+            const double expansion_mm = std::max(0., object.config().raft_first_layer_expansion.value - unscale<double>(inflate_factor_fine));
+            new_layer.polygons = to_polygons(offset_ex_with_brim_gap(union_ex(first_layer), gap_mm, expansion_mm));
         }
         // Insert the base layers.
         for (size_t i = 1; i < slicing_params.base_raft_layers; ++ i) {
@@ -390,14 +391,9 @@ SupportGeneratorLayersPtr generate_raft_base(
             // BBS: if first layer of support is intersected with object island, it must have the same function as brim unless in nobrim mode.
             // brim_object_gap is changed to 0 by default, it's no longer appropriate to use it to determine the gap of first layer support.
             trimming = offset(object.layers().front()->lslices, (float) scale_(support_params.gap_xy_first_layer), SUPPORT_SURFACES_OFFSET_PARAMETERS);
-            if (inflate_factor_1st_layer > SCALED_EPSILON) {
-                // Inflate in multiple steps to avoid leaking of the support 1st layer through object walls.
-                auto  nsteps = std::max(5, int(ceil(inflate_factor_1st_layer / support_params.first_layer_flow.scaled_width())));
-                float step   = inflate_factor_1st_layer / nsteps;
-                for (int i = 0; i < nsteps; ++ i)
-                    raft = diff(expand(raft, step), trimming);
-            } else
-                raft = diff(raft, trimming);
+            const double gap_mm = object.config().support_brim_object_gap.value;
+            const double expansion_mm = std::max(0., object.config().raft_first_layer_expansion.value - unscale<double>(inflate_factor_fine));
+            raft = expand_support_first_layer(raft, gap_mm, expansion_mm, trimming, float(support_params.first_layer_flow.scaled_width()));
             if (! interface_polygons.empty())
                 columns_base->polygons = diff(columns_base->polygons, interface_polygons);
         }
@@ -414,6 +410,62 @@ SupportGeneratorLayersPtr generate_raft_base(
     }
 
     return raft_layers;
+}
+
+Polygons expand_support_first_layer(
+    const Polygons &base,
+    double          gap_mm,
+    double          expansion_mm,
+    const Polygons &trimming,
+    float           step_scaled)
+{
+    Polygons trimmed = trimming.empty() ? base : diff(base, trimming);
+    if (expansion_mm <= EPSILON)
+        return trimmed;
+
+    auto grow_trimmed = [&](Polygons poly, float distance_scaled) {
+        if (distance_scaled <= SCALED_EPSILON)
+            return poly;
+        const float step_w = std::max(step_scaled, 1.f);
+        const int   nsteps = std::max(5, int(ceil(distance_scaled / step_w)));
+        const float step   = distance_scaled / nsteps;
+        for (int i = 0; i < nsteps; ++i)
+            poly = trimming.empty() ? expand(poly, step) : diff(expand(poly, step), trimming);
+        return poly;
+    };
+
+    Polygons start = trimmed;
+    if (gap_mm < -EPSILON) {
+        Polygons inset = shrink(trimmed, float(scale_(-gap_mm)));
+        if (!inset.empty())
+            start = inset;
+    }
+
+    const double grow_mm = std::max(0., gap_mm) + expansion_mm;
+    Polygons grown = grow_trimmed(start, float(scale_(grow_mm)));
+    if (gap_mm <= EPSILON)
+        return grown;
+
+    Polygons inner = grow_trimmed(trimmed, float(scale_(gap_mm)));
+    return union_(trimmed, diff(grown, inner));
+}
+
+ExPolygons offset_ex_with_brim_gap(const ExPolygons &base, double gap_mm, double expansion_mm)
+{
+    if (expansion_mm <= EPSILON)
+        return base;
+    if (gap_mm > EPSILON) {
+        ExPolygons outer = offset_ex(base, scale_(gap_mm + expansion_mm));
+        ExPolygons inner = offset_ex(base, scale_(gap_mm));
+        return union_ex(base, diff_ex(outer, inner));
+    }
+    if (gap_mm < -EPSILON) {
+        ExPolygons start = offset_ex(base, scale_(gap_mm));
+        if (start.empty())
+            start = base;
+        return offset_ex(start, scale_(expansion_mm));
+    }
+    return offset_ex(base, scale_(expansion_mm));
 }
 
 static inline void fill_expolygon_generate_paths(

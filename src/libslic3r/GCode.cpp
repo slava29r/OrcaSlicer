@@ -8240,6 +8240,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         _mm3_per_mm *= m_config.internal_bridge_flow;
     } else if (path.role() == erBrim) {
         _mm3_per_mm *= m_config.brim_flow_ratio;
+    } else if (this->on_first_layer() && (path.role() == erSupportMaterial || path.role() == erSupportMaterialInterface)) {
+        _mm3_per_mm *= m_config.support_brim_flow_ratio;
     } else if (sloped) {
         _mm3_per_mm *= m_config.scarf_joint_flow_ratio;
     }

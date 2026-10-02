@@ -144,6 +144,20 @@ int idx_lower_or_equal(const std::vector<T*> &vec, int idx, FN_LOWER_EQUAL fn_lo
     return idx_lower_or_equal(vec.begin(), vec.end(), idx, fn_lower_equal);
 }
 
+// Expand `base` by `expansion_mm`. A positive `gap_mm` leaves an empty ring between
+// the original shape and the brim; a negative gap starts the brim inside the original
+// shape. `trimming` is subtracted after each grow step so the brim cannot leak through
+// object walls. A zero gap matches a plain expansion.
+Polygons expand_support_first_layer(
+    const Polygons &base,
+    double          gap_mm,
+    double          expansion_mm,
+    const Polygons &trimming,
+    float           step_scaled);
+
+// Same as expand_support_first_layer without stepwise trimming, for raft/tree ExPolygons.
+ExPolygons offset_ex_with_brim_gap(const ExPolygons &base, double gap_mm, double expansion_mm);
+
 } // namespace Slic3r
 
 #endif /* slic3r_SupportCommon_hpp_ */
