@@ -1,24 +1,46 @@
 // Orca: WipeTower2 for all non bbl printers, support all MMU device and toolchanger.
 #include "WipeTower2.hpp"
 
+#include <algorithm>
+#include <Eigen/Geometry>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <cstddef>
+#include <cstdio>
 #include <iostream>
+#include <map>
+#include <string>
+#include <math.h>
+#include <limits>
+#include <utility>
 #include <vector>
 #include <numeric>
 #include <memory>
 #include <sstream>
 #include <iomanip>
 
+#include "libslic3r/Circle.hpp"
+#include "libslic3r/ArcFitter.hpp"
 #include "ClipperUtils.hpp"
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/GCode/WipeTower.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Fill/FillBase.hpp"
 #include "GCodeProcessor.hpp"
 #include "BoundingBox.hpp"
+#include "libslic3r/Line.hpp"
 #include "LocalesUtils.hpp"
 #include "Geometry.hpp"
+#include "libslic3r/Polygon.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "PrintConfig.hpp"
 #include "Surface.hpp"
-#include "Fill/FillRectilinear.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include <boost/algorithm/string/predicate.hpp>
+#include "libslic3r/Config.hpp"
 
 
 namespace Slic3r
@@ -1065,7 +1087,7 @@ WipeTower2::WipeTower2(const PrintConfig& config, const PrintRegionConfig& defau
     m_perimeter_speed(default_region_config.inner_wall_speed.get_at(get_extruder_index(config, (unsigned int)initial_tool))),
     m_current_tool(initial_tool),
     wipe_volumes(wiping_matrix), m_wipe_tower_max_purge_speed(float(config.wipe_tower_max_purge_speed)),
-    m_enable_arc_fitting(config.enable_arc_fitting), 
+    m_enable_arc_fitting(config.enable_arc_fitting.value == ArcFittingMode::Enabled), 
     m_used_fillet(config.wipe_tower_fillet_wall), 
     m_rib_width(config.wipe_tower_rib_width), 
     m_extra_rib_length(config.wipe_tower_extra_rib_length),

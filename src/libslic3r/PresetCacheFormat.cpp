@@ -1,9 +1,20 @@
 #include "libslic3r/PresetCacheFormat.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cereal/archives/binary.hpp>
+#include <cstddef>
+#include <cereal/details/helpers.hpp>
+#include <cereal/cereal.hpp>
+#include <ios>
+#include <exception>
+#include <boost/filesystem/operations.hpp>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 #include <boost/crc.hpp>
@@ -14,7 +25,12 @@
 #include <boost/nowide/fstream.hpp>
 #include <cereal/types/map.hpp>
 #include <cereal/types/set.hpp>
+#include <vector>
 
+#include "Config.hpp"
+#include "PrintConfig.hpp"
+#include "Semver.hpp"
+#include "Preset.hpp"
 #include "libslic3r/Utils.hpp"
 
 namespace Slic3r {
@@ -455,9 +471,11 @@ bool VendorCacheFile::save(const std::string& path, const std::string& vendor_na
     }
 }
 
-// static
-bool VendorCacheFile::load(const std::string& path, const std::string& expected_vendor_name,
-                           const Semver& expected_vendor_version, VendorCacheData& data)
+// Reads a cache through its vendor profiles under the checks load() documents, then
+// calls read_rest on the archive.
+template<class ReadRest>
+static bool read_cache_up_to_presets(const std::string& path, const std::string& expected_vendor_name,
+                                     const Semver& expected_vendor_version, VendorMap& vendors, ReadRest&& read_rest)
 {
     std::string blob;
     if (! read_cache_blob(path, blob))
@@ -472,18 +490,40 @@ bool VendorCacheFile::load(const std::string& path, const std::string& expected_
             return false;
         CacheDictionary dict;
         dict.load(ar);
-        ar(data.vendors);
-        load_entries(ar, data.process_entries, dict);
-        load_entries(ar, data.filament_entries, dict);
-        load_entries(ar, data.machine_entries, dict);
-        ar(data.parse_errors);
-        if (data.vendors.find(expected_vendor_name) == data.vendors.end())
+        ar(vendors);
+        read_rest(ar, dict);
+        if (vendors.find(expected_vendor_name) == vendors.end())
             throw std::runtime_error("vendor cache does not carry its own vendor profile");
         return true;
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(warning) << "VendorCacheFile: rejecting vendor cache " << path << ": " << e.what();
         return false;
     }
+}
+
+// static
+bool VendorCacheFile::load(const std::string& path, const std::string& expected_vendor_name,
+                           const Semver& expected_vendor_version, VendorCacheData& data)
+{
+    return read_cache_up_to_presets(path, expected_vendor_name, expected_vendor_version, data.vendors,
+        [&data](cereal::BinaryInputArchive& ar, const CacheDictionary& dict) {
+            load_entries(ar, data.process_entries, dict);
+            load_entries(ar, data.filament_entries, dict);
+            load_entries(ar, data.machine_entries, dict);
+            ar(data.parse_errors);
+        });
+}
+
+// static
+bool VendorCacheFile::load_vendor_profile(const std::string& path, const std::string& expected_vendor_name,
+                                          const Semver& expected_vendor_version, VendorProfile& vendor)
+{
+    VendorMap vendors;
+    if (! read_cache_up_to_presets(path, expected_vendor_name, expected_vendor_version, vendors,
+                                   [](cereal::BinaryInputArchive&, const CacheDictionary&) {}))
+        return false;
+    vendor = std::move(vendors.find(expected_vendor_name)->second);
+    return true;
 }
 
 // static
@@ -527,7 +567,7 @@ Semver VendorCacheFile::usable_version(const std::string& path, const std::strin
 
 // static
 bool VendorCacheFile::carries_preset(const std::string& path, const std::string& vendor_name,
-                                     Preset::Type type, const std::string& preset_name)
+                                     Preset::Type type, const std::string& preset_name, bool renamed)
 {
     std::string blob;
     if (! read_cache_blob(path, blob))
@@ -541,7 +581,7 @@ bool VendorCacheFile::carries_preset(const std::string& path, const std::string&
         dict.load(ar);
         VendorMap vendors;
         ar(vendors);
-        // Reused: every entry overwrites it, and only its name is ever looked at.
+        // Reused: every entry overwrites it, and only its names are ever looked at.
         CachedPreset entry;
         // Written in this order by save. The list that could carry the preset
         // is the last one worth reading.
@@ -550,7 +590,8 @@ bool VendorCacheFile::carries_preset(const std::string& path, const std::string&
             ar(cnt);
             for (uint32_t i = 0; i < cnt; ++ i) {
                 visit_entry(ar, entry, [&] { skip_config(ar, dict); });
-                if (kind == type && entry.name == preset_name)
+                if (kind == type && (renamed ? std::find(entry.renamed_from.begin(), entry.renamed_from.end(), preset_name) != entry.renamed_from.end() :
+                                               entry.name == preset_name))
                     return true;
             }
             if (kind == type)
